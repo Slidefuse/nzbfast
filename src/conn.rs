@@ -288,13 +288,16 @@ fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>) -> io::Result<()> {
                 let w = inflight.pop_front().unwrap();
                 sent -= 1;
                 ctx.st.bytes.fetch_add((e - s) as u64, Relaxed);
+                ctx.q.record(ctx.idx, true, w.tried != 0);
                 match yenc::decode(&rd.buf[s..e], &mut out) {
                     Ok((info, crc)) => {
                         ctx.st.ok.fetch_add(1, Relaxed);
                         w.job.on_article(w.file, w.seg, &info, &out, crc, &ctx.q);
                     }
-                    Err(_) => {
-                        ctx.st.crc_errors.fetch_add(1, Relaxed);
+                    Err(e) => {
+                        if ctx.st.crc_errors.fetch_add(1, Relaxed) < 3 {
+                            eprintln!("[{}] decode error {:?} for {}", ctx.cfg.name, e, w.job.msgid(w.file, w.seg));
+                        }
                         if let Some(w) = ctx.q.retry_elsewhere(ctx.idx, w) {
                             w.job.on_missing(w.file, w.seg, &ctx.q);
                         }
@@ -305,6 +308,7 @@ fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>) -> io::Result<()> {
                 let w = inflight.pop_front().unwrap();
                 sent -= 1;
                 ctx.st.missing.fetch_add(1, Relaxed);
+                ctx.q.record(ctx.idx, false, w.tried != 0);
                 if let Some(w) = ctx.q.retry_elsewhere(ctx.idx, w) {
                     w.job.on_missing(w.file, w.seg, &ctx.q);
                 }

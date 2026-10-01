@@ -89,6 +89,7 @@ struct Plan {
     raw_rar: Vec<usize>,
 }
 
+#[derive(Default)]
 struct RepairFetch {
     outs: HashMap<u32, Arc<OutFile>>,
     paths: Vec<PathBuf>,
@@ -103,6 +104,7 @@ struct Piece {
 }
 
 struct JState {
+    missing_files: std::collections::HashSet<u32>,
     probes_left: usize,
     probes: Vec<Option<Probe>>,
     pieces: Vec<Piece>,
@@ -116,7 +118,7 @@ pub struct Job {
     pub files: Vec<JFile>,
     state: Mutex<JState>,
     plan: OnceLock<Plan>,
-    repair: OnceLock<RepairFetch>,
+    repair: Mutex<RepairFetch>,
     remaining: AtomicUsize,
     pending_io: AtomicUsize,
     stage: AtomicU8,
@@ -183,6 +185,12 @@ fn is_obfuscated(name: &str) -> bool {
     stem.len() >= 10 && !stem.contains([' ', '.', '_', '-'])
 }
 
+/// Files Plex/*arr never need; damage there does not require a repair.
+fn non_essential(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    [".par2", ".nfo", ".sfv", ".srr", ".srs", ".nzb", ".jpg", ".png", ".txt", ".url", ".md5"].iter().any(|e| l.ends_with(e))
+}
+
 fn looks_like_rar(name: &str) -> bool {
     let l = name.to_ascii_lowercase();
     l.ends_with(".rar") || rar::name_order(&l).is_some_and(|_| !l.ends_with(".par2"))
@@ -241,10 +249,10 @@ impl Job {
             work: tmp.join(&nzb.name),
             done_dir: done.join(&nzb.name),
             name: nzb.name,
-            state: Mutex::new(JState { probes_left, probes: files.iter().map(|_| None).collect(), pieces: vec![] }),
+            state: Mutex::new(JState { missing_files: Default::default(), probes_left, probes: files.iter().map(|_| None).collect(), pieces: vec![] }),
             files,
             plan: OnceLock::new(),
-            repair: OnceLock::new(),
+            repair: Mutex::new(RepairFetch::default()),
             remaining: AtomicUsize::new(0),
             pending_io: AtomicUsize::new(0),
             stage: AtomicU8::new(0),
@@ -293,6 +301,7 @@ impl Job {
 
     pub fn on_missing(self: &Arc<Self>, file: u32, seg: u32, q: &Queues) {
         self.missing.fetch_add(1, Relaxed);
+        self.state.lock().unwrap().missing_files.insert(file);
         let b = self.files[file as usize].segs[seg as usize].bytes as u64;
         let mb = self.missing_bytes.fetch_add(b, Relaxed) + b;
         if self.stage.load(Relaxed) == 0 && mb > self.recoverable.load(Relaxed).saturating_add(1 << 20) {
@@ -342,7 +351,14 @@ impl Job {
             }
         }
         self.recoverable.store(rec, Relaxed);
-        if self.missing_bytes.load(Relaxed) > rec.saturating_add(1 << 20) {
+        // A file whose first article is gone is almost always gone entirely (takedown).
+        let projected: u64 = probes
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| p.is_none() && !self.files[*i].skip)
+            .map(|(i, _)| self.files[i].segs.iter().map(|s| s.bytes as u64).sum::<u64>())
+            .sum();
+        if projected.max(self.missing_bytes.load(Relaxed)) > rec.saturating_add(1 << 20) {
             self.aborted.store(true, Relaxed);
             rest.clear();
             remaining = 0;
@@ -371,7 +387,8 @@ impl Job {
         let owner: Arc<dyn IoOwner> = self.clone();
         match plan.targets[file as usize] {
             Target::Skip => {
-                if let Some(out) = self.repair.get().and_then(|r| r.outs.get(&file)) {
+                let out = self.repair.lock().unwrap().outs.get(&file).cloned();
+                if let Some(out) = out {
                     out.write(info.offset(), data, &owner);
                 }
             }
@@ -953,13 +970,23 @@ impl Job {
         for &o in &plan.par2_outs {
             set.add_file(fs::read(&plan.paths[o]).unwrap_or_default());
         }
-        if let Some(r) = self.repair.get() {
-            for p in &r.paths {
-                set.add_file(fs::read(p).unwrap_or_default());
-            }
+        let fetched = self.repair.lock().unwrap().paths.clone();
+        for p in &fetched {
+            set.add_file(fs::read(p).unwrap_or_default());
         }
         if !set.ready() {
-            return RepairOutcome::Failed("par2: no usable index (cannot verify or repair)".into());
+            let already: Vec<u32> = self.repair.lock().unwrap().outs.keys().copied().collect();
+            let smallest = self
+                .files
+                .iter()
+                .enumerate()
+                .filter(|(i, f)| f.skip && !already.contains(&(*i as u32)))
+                .min_by_key(|(_, f)| f.segs.len())
+                .map(|(i, _)| i);
+            match smallest {
+                Some(i) if allow_fetch => return self.fetch_recovery(&[i]),
+                _ => return RepairOutcome::Failed("par2: no usable index (cannot verify or repair)".into()),
+            }
         }
         let map = self.par2_map(plan, &set);
         let t0 = Instant::now();
@@ -987,8 +1014,14 @@ impl Job {
         if !allow_fetch {
             return RepairOutcome::Failed(format!("par2: {} slices damaged, only {} recovery blocks", damaged.len(), set.recv.len()));
         }
-        let mut cands: Vec<(u32, usize)> =
-            self.files.iter().enumerate().filter(|(_, f)| f.skip).map(|(i, f)| (f.par2_blocks.unwrap_or(1), i)).collect();
+        let already: Vec<u32> = self.repair.lock().unwrap().outs.keys().copied().collect();
+        let mut cands: Vec<(u32, usize)> = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(i, f)| f.skip && !already.contains(&(*i as u32)))
+            .map(|(i, f)| (f.par2_blocks.unwrap_or(1), i))
+            .collect();
         cands.sort();
         let mut chosen = vec![];
         let mut have = 0;
@@ -1002,23 +1035,28 @@ impl Job {
         if have < need {
             return RepairOutcome::Failed(format!("par2: need {need} more recovery blocks, only {have} available"));
         }
+        self.fetch_recovery(&chosen)
+    }
+
+    /// Downloads the given recovery files, then re-enters finalize (stage 1).
+    fn fetch_recovery(self: &Arc<Self>, chosen: &[usize]) -> RepairOutcome {
         let dir = self.work.join(".aux").join("par2");
         let _ = fs::create_dir_all(&dir);
-        let mut outs = HashMap::new();
-        let mut paths = vec![];
         let mut work = vec![];
-        for &i in &chosen {
-            let p = dir.join(sanitize(&self.files[i].guess));
-            if let Ok(o) = OutFile::create(&p, 0, false) {
-                outs.insert(i as u32, o);
-                paths.push(p);
-                for s in 0..self.files[i].segs.len() {
-                    work.push(Work { job: self.clone(), file: i as u32, seg: s as u32, tried: 0 });
+        {
+            let mut r = self.repair.lock().unwrap();
+            for &i in chosen {
+                let p = dir.join(sanitize(&self.files[i].guess));
+                if let Ok(o) = OutFile::create(&p, 0, false) {
+                    r.outs.insert(i as u32, o);
+                    r.paths.push(p);
+                    for s in 0..self.files[i].segs.len() {
+                        work.push(Work { job: self.clone(), file: i as u32, seg: s as u32, tried: 0 });
+                    }
                 }
             }
         }
-        let _ = self.repair.set(RepairFetch { outs, paths });
-        self.stage.store(1, Relaxed);
+        self.stage.fetch_add(1, Relaxed);
         self.remaining.store(work.len() + 1, Relaxed);
         QUEUE.get().expect("queue").push_front(work);
         self.segment_done();
@@ -1032,10 +1070,9 @@ impl Job {
         for o in &plan.outs {
             o.flush_partial(&owner);
         }
-        if let Some(r) = self.repair.get() {
-            for o in r.outs.values() {
-                o.flush_partial(&owner);
-            }
+        let routs: Vec<Arc<OutFile>> = self.repair.lock().unwrap().outs.values().cloned().collect();
+        for o in &routs {
+            o.flush_partial(&owner);
         }
         while self.pending_io.load(Relaxed) > 0 {
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -1052,7 +1089,7 @@ impl Job {
         let mut notes = vec![];
         if self.is_aborted() {
             let msg = format!(
-                "hopeless: {:.1} MB missing, only {:.1} MB of par2 recovery in NZB",
+                "hopeless: {:.1} MB missing (or first articles gone), only {:.1} MB of par2 recovery in NZB",
                 self.missing_bytes.load(Relaxed) as f64 / 1e6,
                 self.recoverable.load(Relaxed) as f64 / 1e6
             );
@@ -1060,8 +1097,17 @@ impl Job {
         }
         let missing = self.missing.load(Relaxed);
         let mut repaired = false;
-        if missing > 0 || stage == 1 {
-            match self.try_repair(plan, stage == 0) {
+        let only_extras = {
+            let st = self.state.lock().unwrap();
+            st.missing_files.iter().all(|&f| {
+                let f = f as usize;
+                self.files[f].skip || non_essential(&self.files[f].guess) || non_essential(&plan.ids[f].yname)
+            })
+        };
+        if missing > 0 && stage == 0 && only_extras {
+            notes.push(format!("{missing} articles missing only in par2/nfo/sfv files (not needed)"));
+        } else if missing > 0 || stage >= 1 {
+            match self.try_repair(plan, stage < 2) {
                 RepairOutcome::Fetching => return,
                 RepairOutcome::Repaired(m) => {
                     notes.push(m);

@@ -112,7 +112,7 @@ fn get(args: &[String]) {
     let mut only: Vec<String> = vec![];
     let mut tmp = PathBuf::from("/root/nzbfast/tmp");
     let mut done = PathBuf::from("/root/nzbfast/done");
-    let mut active_max = 64usize;
+    let mut active_max = 256usize;
     let mut depth = 8usize;
     let mut nic = "ens18".to_string();
     let mut limit = usize::MAX;
@@ -150,7 +150,11 @@ fn get(args: &[String]) {
                 "conns" => s.conns = val.parse().unwrap(),
                 "prio" => s.priority = val.parse().unwrap(),
                 "depth" => s.depth = val.parse().unwrap(),
-                "enable" if val == "0" => s.conns = 0,
+                "enable" => {
+                    if val == "0" {
+                        s.conns = 0
+                    }
+                }
                 _ => usage(),
             }
         }
@@ -174,11 +178,7 @@ fn get(args: &[String]) {
     std::fs::create_dir_all(&done).unwrap();
 
     outfile::start_io(8);
-    let min_prio = servers.iter().map(|s| s.priority).min().unwrap();
-    let primary: Vec<bool> = servers.iter().map(|s| s.priority == min_prio).collect();
-    let mut order: Vec<usize> = (0..servers.len()).collect();
-    order.sort_by_key(|&i| (servers[i].priority, i));
-    let q = Arc::new(Queues::new(primary, order));
+    let q = Arc::new(Queues::new(servers.iter().map(|s| s.priority).collect()));
     let _ = job::QUEUE.set(q.clone());
     let stats: Vec<Arc<SStats>> = servers.iter().map(|_| Arc::new(SStats::default())).collect();
     let mut total_conns = 0;
@@ -240,7 +240,14 @@ fn get(args: &[String]) {
                     let d = b - prev[i];
                     prev[i] = b;
                     tot += d;
-                    parts.push_str(&format!(" | {} {:.2}/{}", names[i], d as f64 * 8.0 / 1e9, s.live.load(Relaxed)));
+                    parts.push_str(&format!(
+                        " | {} {:.2}/{} {:.0}%/{:.0}%",
+                        names[i],
+                        d as f64 * 8.0 / 1e9,
+                        s.live.load(Relaxed),
+                        q.hit_rate(i) * 100.0,
+                        q.retry_rate(i) * 100.0
+                    ));
                 }
                 let n = nic_rx(&nic);
                 let nr = (n - prev_nic) as f64 * 8.0 / 1e9;
@@ -259,7 +266,7 @@ fn get(args: &[String]) {
     };
 
     // Feeder: keep the queue deep enough to saturate all connections, finishing jobs roughly in order.
-    let low_water = (total_conns * 6).max(2000);
+    let low_water = (total_conns * 20).max(4000);
     let mut next = 0;
     let n_inputs = inputs.len();
     let mut printer = |rx: &mpsc::Receiver<String>| {
