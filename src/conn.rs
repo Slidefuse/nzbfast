@@ -78,6 +78,41 @@ pub fn tls_config(insecure: bool) -> Arc<rustls::ClientConfig> {
     Arc::new(cfg)
 }
 
+/// Socket wrapper that receives in large chunks: rustls asks for at most a few KB
+/// per read, which would otherwise cost one syscall per 4 KB at multi-Gbit rates.
+struct BigSock {
+    s: TcpStream,
+    buf: Box<[u8]>,
+    pos: usize,
+    end: usize,
+}
+
+impl Read for BigSock {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.pos == self.end {
+            // Large caller buffers bypass the staging copy.
+            if out.len() >= self.buf.len() {
+                return self.s.read(out);
+            }
+            self.end = self.s.read(&mut self.buf)?;
+            self.pos = 0;
+        }
+        let n = out.len().min(self.end - self.pos);
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+impl Write for BigSock {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        self.s.write(b)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.s.flush()
+    }
+}
+
 fn connect(cfg: &ServerCfg, tls: &Arc<rustls::ClientConfig>) -> io::Result<Box<dyn Stream>> {
     let addr = (cfg.host.as_str(), cfg.port)
         .to_socket_addrs()?
@@ -92,7 +127,8 @@ fn connect(cfg: &ServerCfg, tls: &Arc<rustls::ClientConfig>) -> io::Result<Box<d
     }
     let name = ServerName::try_from(cfg.host.clone()).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let conn = rustls::ClientConnection::new(tls.clone(), name).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    Ok(Box::new(rustls::StreamOwned::new(conn, tcp)))
+    let sock = BigSock { s: tcp, buf: vec![0u8; 1 << 20].into_boxed_slice(), pos: 0, end: 0 };
+    Ok(Box::new(rustls::StreamOwned::new(conn, sock)))
 }
 
 struct Rd {
@@ -316,4 +352,20 @@ fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>) -> io::Result<()> {
             _ => return Err(err(format!("unexpected: {}", &status[..status.len().min(80)]))),
         }
     }
+}
+
+/// Debug helper: fetches one article body (raw, as sent by the server).
+pub fn fetch_raw(cfg: &ServerCfg, msgid: &str) -> io::Result<Vec<u8>> {
+    let tls = tls_config(cfg.insecure);
+    let s = connect(cfg, &tls)?;
+    let mut rd = Rd { s, buf: vec![0; 8 << 20], start: 0, end: 0 };
+    login(&mut rd, cfg)?;
+    send(&mut rd, &format!("BODY {msgid}\r\n"))?;
+    let status = rd.line()?;
+    if !status.starts_with("222") {
+        return Err(err(format!("status: {status}")));
+    }
+    let fin = memmem::Finder::new(b"\r\n.\r\n");
+    let (a, b) = rd.block(&fin)?;
+    Ok(rd.buf[a..b].to_vec())
 }

@@ -88,6 +88,18 @@ fn main() {
             mock::serve(Path::new(&dir.unwrap_or_else(|| usage())), port, tls, &drops).unwrap();
         }
         "bench" => bench(),
+        "fetch" => {
+            // fetch SAB_INI SERVER_SUBSTR MSGID OUT
+            let servers = config::from_sab_ini(&rest[0]).unwrap();
+            let mut cfg = servers.into_iter().find(|s| s.name.to_lowercase().contains(&rest[1].to_lowercase())).expect("server");
+            if rest.len() > 4 {
+                cfg.host = rest[4].clone();
+            }
+            let body = conn::fetch_raw(&cfg, &rest[2]).unwrap();
+            std::fs::write(&rest[3], &body).unwrap();
+            let mut out = vec![];
+            println!("{} bytes; decode: {:?}", body.len(), yenc::decode(&body, &mut out).map(|(i, c)| (i, c, out.len())));
+        }
         "rarcheck" => {
             for f in rest {
                 let b = std::fs::read(f).unwrap();
