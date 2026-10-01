@@ -58,9 +58,13 @@ pub fn gen(out: &Path, releases: &[String]) -> io::Result<()> {
 struct Store {
     data: Vec<u8>,
     idx: HashMap<String, (usize, usize)>,
+    /// Message-ids answered with 430 (simulated missing articles).
+    drop: std::collections::HashSet<String>,
 }
 
-pub fn serve(dir: &Path, port: u16, tls: bool) -> io::Result<()> {
+/// `drop`: list of `substring:every` rules; ids containing `substring` whose part
+/// number is divisible by `every` are reported missing (every=0 drops all matches).
+pub fn serve(dir: &Path, port: u16, tls: bool, drop_rules: &[String]) -> io::Result<()> {
     let data = fs::read(dir.join("articles.bin"))?;
     let mut idx = HashMap::new();
     for line in fs::read_to_string(dir.join("index.tsv"))?.lines() {
@@ -68,8 +72,20 @@ pub fn serve(dir: &Path, port: u16, tls: bool) -> io::Result<()> {
         let (Some(id), Some(o), Some(l)) = (it.next(), it.next(), it.next()) else { continue };
         idx.insert(id.to_string(), (o.parse().unwrap(), l.parse().unwrap()));
     }
+    let mut drop = std::collections::HashSet::new();
+    for id in idx.keys() {
+        for r in drop_rules {
+            let (sub, every) = r.split_once(':').unwrap_or((r.as_str(), "0"));
+            let every: usize = every.parse().unwrap_or(0);
+            let part: usize = id.rsplit('.').next().and_then(|t| t.split('@').next()).and_then(|n| n.parse().ok()).unwrap_or(1);
+            if id.contains(sub) && (every == 0 || part % every == every - 1) {
+                drop.insert(id.clone());
+            }
+        }
+    }
+    eprintln!("mock: dropping {} articles", drop.len());
     eprintln!("mock: {} articles, {:.1} GB in RAM, port {port}, tls={tls}", idx.len(), data.len() as f64 / 1e9);
-    let store = Arc::new(Store { data, idx });
+    let store = Arc::new(Store { data, idx, drop });
     let server_cfg = if tls {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert = ck.cert.der().clone();
@@ -116,7 +132,7 @@ fn handle<S: Read + Write>(mut s: S, st: &Store) -> io::Result<()> {
             let up = line.to_ascii_uppercase();
             if up.starts_with("BODY ") {
                 let id = line[5..].trim();
-                match st.idx.get(id) {
+                match st.idx.get(id).filter(|_| !st.drop.contains(id)) {
                     Some(&(o, l)) => s.write_all(&st.data[o..o + l])?,
                     None => s.write_all(b"430 no such article\r\n")?,
                 }

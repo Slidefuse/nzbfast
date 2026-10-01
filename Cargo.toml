@@ -11,6 +11,7 @@ flate2 = "1"
 memchr = "2"
 crc32fast = "1"
 libc = "0.2"
+md-5 = "0.10"
 
 [profile.release]
 opt-level = 3

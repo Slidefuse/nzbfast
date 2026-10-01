@@ -1,4 +1,6 @@
 mod config;
+mod gf16;
+mod par2;
 mod conn;
 mod job;
 mod mock;
@@ -72,16 +74,18 @@ fn main() {
         }
         "mock-serve" => {
             let (mut dir, mut port, mut tls) = (None, 1119u16, false);
+            let mut drops = vec![];
             let mut it = rest.iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
                     "--dir" => dir = it.next().cloned(),
                     "--port" => port = it.next().unwrap().parse().unwrap(),
                     "--tls" => tls = true,
+                    "--drop" => drops.push(it.next().unwrap().clone()),
                     _ => usage(),
                 }
             }
-            mock::serve(Path::new(&dir.unwrap_or_else(|| usage())), port, tls).unwrap();
+            mock::serve(Path::new(&dir.unwrap_or_else(|| usage())), port, tls, &drops).unwrap();
         }
         "bench" => bench(),
         "rarcheck" => {
@@ -108,11 +112,13 @@ fn get(args: &[String]) {
     let mut only: Vec<String> = vec![];
     let mut tmp = PathBuf::from("/root/nzbfast/tmp");
     let mut done = PathBuf::from("/root/nzbfast/done");
-    let mut active_max = 6usize;
+    let mut active_max = 64usize;
     let mut depth = 8usize;
     let mut nic = "ens18".to_string();
     let mut limit = usize::MAX;
     let mut inputs = vec![];
+    let mut sets: Vec<String> = vec![];
+    let mut list_only = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut v = || it.next().cloned().unwrap_or_else(|| usage());
@@ -126,9 +132,35 @@ fn get(args: &[String]) {
             "--depth" => depth = v().parse().unwrap(),
             "--nic" => nic = v(),
             "--limit" => limit = v().parse().unwrap(),
+            "--set" => sets.push(v()),
+            "--list-servers" => list_only = true,
             s if s.starts_with("--") => usage(),
             _ => collect_nzbs(Path::new(a), &mut inputs),
         }
+    }
+    // --set name:key=value (key: host, port, conns, prio, depth, enable)
+    for spec in &sets {
+        let (name, kv) = spec.split_once(':').unwrap_or_else(|| usage());
+        let (k, val) = kv.split_once('=').unwrap_or_else(|| usage());
+        let name = name.to_lowercase();
+        for s in servers.iter_mut().filter(|s| s.name.to_lowercase().contains(&name) || s.host.contains(&name)) {
+            match k {
+                "host" => s.host = val.to_string(),
+                "port" => s.port = val.parse().unwrap(),
+                "conns" => s.conns = val.parse().unwrap(),
+                "prio" => s.priority = val.parse().unwrap(),
+                "depth" => s.depth = val.parse().unwrap(),
+                "enable" if val == "0" => s.conns = 0,
+                _ => usage(),
+            }
+        }
+    }
+    servers.retain(|s| s.conns > 0);
+    if list_only {
+        for s in &servers {
+            println!("{:<22} {}:{} tls={} conns={} prio={} user_set={}", s.name, s.host, s.port, s.tls, s.conns, s.priority, !s.user.is_empty());
+        }
+        return;
     }
     if !only.is_empty() {
         servers.retain(|s| only.iter().any(|o| s.name.to_lowercase().contains(o) || s.host.contains(o)));
@@ -136,6 +168,7 @@ fn get(args: &[String]) {
     if servers.is_empty() || inputs.is_empty() {
         usage();
     }
+    let _ = &list_only;
     inputs.truncate(limit);
     std::fs::create_dir_all(&tmp).unwrap();
     std::fs::create_dir_all(&done).unwrap();
@@ -146,6 +179,7 @@ fn get(args: &[String]) {
     let mut order: Vec<usize> = (0..servers.len()).collect();
     order.sort_by_key(|&i| (servers[i].priority, i));
     let q = Arc::new(Queues::new(primary, order));
+    let _ = job::QUEUE.set(q.clone());
     let stats: Vec<Arc<SStats>> = servers.iter().map(|_| Arc::new(SStats::default())).collect();
     let mut total_conns = 0;
     eprintln!("servers:");

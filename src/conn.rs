@@ -198,11 +198,23 @@ pub struct ConnCtx {
     pub st: Arc<SStats>,
 }
 
+/// Pops the next work item, discarding items of aborted (hopeless) jobs.
+fn pop_live(ctx: &ConnCtx, wait: Option<Duration>) -> Option<Work> {
+    loop {
+        let w = ctx.q.pop(ctx.idx, wait)?;
+        if w.job.is_aborted() {
+            w.job.drop_work(w.file, w.seg, &ctx.q);
+            continue;
+        }
+        return Some(w);
+    }
+}
+
 pub fn run(ctx: ConnCtx) {
     let mut backoff = 1;
     loop {
         // Only connect when there is work.
-        let Some(first) = ctx.q.pop(ctx.idx, Some(Duration::from_secs(5))) else {
+        let Some(first) = pop_live(&ctx, Some(Duration::from_secs(5))) else {
             if ctx.q.is_closed() {
                 return;
             }
@@ -244,13 +256,13 @@ fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>) -> io::Result<()> {
     loop {
         // Top up the pipeline.
         while inflight.len() < ctx.depth {
-            match ctx.q.pop(ctx.idx, None) {
+            match pop_live(ctx, None) {
                 Some(w) => inflight.push_back(w),
                 None => break,
             }
         }
         if inflight.is_empty() {
-            match ctx.q.pop(ctx.idx, Some(Duration::from_secs(20))) {
+            match pop_live(ctx, Some(Duration::from_secs(20))) {
                 Some(w) => inflight.push_back(w),
                 None => {
                     let _ = send(&mut rd, "QUIT\r\n");
