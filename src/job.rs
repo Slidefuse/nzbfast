@@ -891,10 +891,13 @@ impl Job {
             g.sort_by_key(|c| if all5 { c.1.vol_num.unwrap() } else { rar::name_order(&c.0.to_string_lossy()).unwrap_or(u64::MAX) });
         }
         // Stored volumes can be copied file by file only if every file starts in its own
-        // volume; otherwise (several files per archive) the library unpacks them.
-        let clean = groups.values().all(|g| {
-            g.iter().map(|c| c.1.pack_size).sum::<u64>() == g[0].1.unp_size && !g[0].1.split_before && !g.last().unwrap().1.split_after
-        });
+        // volume and nothing else needs the library: a stored file can share a volume
+        // with the start of a compressed one (e.g. a small "rename" file in part01), and
+        // extracting it would consume that volume.
+        let clean = others.is_empty()
+            && groups.values().all(|g| {
+                g.iter().map(|c| c.1.pack_size).sum::<u64>() == g[0].1.unp_size && !g[0].1.split_before && !g.last().unwrap().1.split_after
+            });
         if !clean {
             for (_, g) in groups.drain() {
                 for (p, v, _) in g {
