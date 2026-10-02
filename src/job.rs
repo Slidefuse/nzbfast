@@ -129,6 +129,8 @@ pub struct Job {
     pub done_dir: Option<PathBuf>,
     /// Password for encrypted archives (from the NZB or the job name).
     pub password: Option<String>,
+    /// Output files renamed after planning (to the names par2 knows them by).
+    renamed: Mutex<HashMap<PathBuf, PathBuf>>,
     pub files: Vec<JFile>,
     state: Mutex<JState>,
     plan: OnceLock<Plan>,
@@ -269,6 +271,30 @@ impl Seek for Chain {
     }
 }
 
+/// Volume designation of a split-archive name ("x.part15.rar" -> "rar:15", "x.r07" ->
+/// "r:7", "x.7z.003" -> "7z:3", "x.004" -> "n:4"), used to pair files whose obfuscated
+/// names differ from the names par2 knows them by.
+fn vol_suffix(name: &str) -> Option<String> {
+    let l = name.to_ascii_lowercase();
+    if let Some(stem) = l.strip_suffix(".rar") {
+        if let Some(i) = stem.rfind(".part") {
+            if let Ok(n) = stem[i + 5..].parse::<u32>() {
+                return Some(format!("rar:{n}"));
+            }
+        }
+        return Some("rar:0".into());
+    }
+    let (stem, ext) = l.rsplit_once('.')?;
+    if ext.len() == 3 && ext.bytes().skip(1).all(|c| c.is_ascii_digit()) && (ext.starts_with('r') || ext.starts_with('s')) {
+        return Some(format!("{}:{}", &ext[..1], ext[1..].parse::<u32>().ok()?));
+    }
+    if ext.len() == 3 && ext.bytes().all(|c| c.is_ascii_digit()) {
+        let n: u32 = ext.parse().ok()?;
+        return Some(if stem.ends_with(".7z") { format!("7z:{n}") } else { format!("n:{n}") });
+    }
+    None
+}
+
 fn looks_like_rar(name: &str) -> bool {
     let l = name.to_ascii_lowercase();
     l.ends_with(".rar") || rar::name_order(&l).is_some_and(|_| !l.ends_with(".par2"))
@@ -327,6 +353,7 @@ impl Job {
             work,
             done_dir,
             password: nzb.password,
+            renamed: Mutex::new(HashMap::new()),
             name: nzb.name,
             state: Mutex::new(JState { missing_files: Default::default(), probes_left, probes: files.iter().map(|_| None).collect(), pieces: vec![] }),
             files,
@@ -396,6 +423,47 @@ impl Job {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Relaxed)
+    }
+
+    /// Current location of a planned output file.
+    fn cur(&self, p: &Path) -> PathBuf {
+        self.renamed.lock().unwrap().get(p).cloned().unwrap_or_else(|| p.to_path_buf())
+    }
+
+    /// Gives leftover archive volumes the names par2 knows them by (obfuscated posts
+    /// often carry meaningless names, while the order of RAR4 volumes is only in
+    /// their names).
+    fn rename_by_par2(&self, plan: &Plan, set: &Par2Set, map: &[Option<VSrc>]) -> usize {
+        let aux = self.work.join(".aux");
+        let mut n = 0;
+        for (k, m) in map.iter().enumerate() {
+            let Some(VSrc::Out { out, .. }) = m else { continue };
+            let Some(orig) = plan.paths.get(*out) else { continue };
+            let path = self.cur(orig);
+            let want = sanitize(&set.files[&set.recovery_ids[k]].name);
+            if !path.starts_with(&aux) || path.file_name() == want.file_name() {
+                continue;
+            }
+            let Some(dir) = path.parent() else { continue };
+            let dst = dir.join(want.file_name().unwrap_or_default());
+            if !dst.exists() && fs::rename(&path, &dst).is_ok() {
+                self.renamed.lock().unwrap().insert(orig.clone(), dst);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// The par2 set of this job (index plus any recovery volumes fetched so far).
+    fn load_par2(&self, plan: &Plan) -> Par2Set {
+        let mut set = Par2Set::default();
+        for &o in &plan.par2_outs {
+            set.add_file(fs::read(self.cur(&plan.paths[o])).unwrap_or_default());
+        }
+        for p in self.repair.lock().unwrap().paths.clone() {
+            set.add_file(fs::read(p).unwrap_or_default());
+        }
+        set
     }
 
     fn seg_bytes(&self, file: u32, seg: u32) -> u64 {
@@ -609,6 +677,37 @@ impl Job {
                 }
             }
         };
+        // One name per file: some posters give every file the same yEnc name, which
+        // would make them overwrite each other. Fall back to the subject's name, then
+        // to a numbered name.
+        let mut chosen: Vec<String> = self
+            .files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| match &probes[i] {
+                Some(p) if !p.info.name.is_empty() => p.info.name.clone(),
+                _ => f.guess.clone(),
+            })
+            .collect();
+        {
+            let mut count: HashMap<String, usize> = HashMap::new();
+            for (i, n) in chosen.iter().enumerate() {
+                if !self.files[i].skip {
+                    *count.entry(n.to_lowercase()).or_default() += 1;
+                }
+            }
+            let guesses: HashMap<String, usize> = self.files.iter().fold(HashMap::new(), |mut m, f| {
+                *m.entry(f.guess.to_lowercase()).or_default() += 1;
+                m
+            });
+            for (i, n) in chosen.iter_mut().enumerate() {
+                if self.files[i].skip || count.get(&n.to_lowercase()).copied().unwrap_or(0) < 2 {
+                    continue;
+                }
+                let g = &self.files[i].guess;
+                *n = if guesses.get(&g.to_lowercase()).copied().unwrap_or(0) == 1 { g.clone() } else { format!("{n}.{i}") };
+            }
+        }
         for (i, f) in self.files.iter().enumerate() {
             if f.skip {
                 targets.push(Target::Skip);
@@ -635,7 +734,33 @@ impl Job {
                 targets.push(t);
                 continue;
             };
-            let name = if p.info.name.is_empty() { f.guess.clone() } else { p.info.name.clone() };
+            let name = chosen[i].clone();
+            if p.info.offset() > 0 {
+                // The NZB lacks the file's first segment: its type cannot be read from
+                // the data, so go by name and leave the gap to par2.
+                notes.push(format!("first segment not in NZB for {name}"));
+                let (dir, kind) = if looks_like_rar(&name) {
+                    (aux.join("rar"), 1)
+                } else if looks_like_7z(&name) {
+                    (aux.join("7z"), 2)
+                } else if is_par2_name(&name) {
+                    (aux.clone(), 3)
+                } else {
+                    (self.work.clone(), 0)
+                };
+                let t = make(&dir, &name, p.info.size, &mut outs, &mut paths);
+                if let Target::Plain { out } = t {
+                    match kind {
+                        1 => raw_rar.push(out),
+                        2 => sevenz.push(out),
+                        3 => par2_outs.push(out),
+                        _ => {}
+                    }
+                }
+                ids[i] = FileId { yname: name.clone(), size: p.info.size, md5_16k: None };
+                targets.push(t);
+                continue;
+            }
             let whole = p.data.len() as u64 == p.info.size;
             ids[i] = FileId {
                 yname: name.clone(),
@@ -872,9 +997,13 @@ impl Job {
         let mut others: Vec<(PathBuf, Option<RarVol>, usize)> = vec![];
         let nzb_order = |o: usize| plan.targets.iter().position(|t| matches!(t, Target::Plain { out } if *out == o)).unwrap_or(usize::MAX);
         let mut order: HashMap<PathBuf, usize> = HashMap::new();
-        for &o in &plan.raw_rar {
-            let p = &plan.paths[o];
-            order.insert(p.clone(), nzb_order(o));
+        // The directory is authoritative: repair may have added or renamed volumes.
+        let index: HashMap<PathBuf, usize> = plan.raw_rar.iter().map(|&o| (self.cur(&plan.paths[o]), nzb_order(o))).collect();
+        let mut vols: Vec<PathBuf> = fs::read_dir(self.work.join(".aux").join("rar")).map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect()).unwrap_or_default();
+        vols.sort();
+        for p in &vols {
+            let o_order = index.get(p).copied().unwrap_or(usize::MAX);
+            order.insert(p.clone(), o_order);
             let mut head = vec![0u8; 65536];
             let n = File::open(p).and_then(|mut f| f.read(&mut head)).unwrap_or(0);
             head.truncate(n);
@@ -883,7 +1012,7 @@ impl Job {
                     let size = fs::metadata(p).map(|m| m.len()).unwrap_or(0);
                     groups.entry(v.inner_name.clone()).or_default().push((p.clone(), v, size));
                 }
-                v => others.push((p.clone(), v, nzb_order(o))),
+                v => others.push((p.clone(), v, o_order)),
             }
         }
         for g in groups.values_mut() {
@@ -1037,10 +1166,11 @@ impl Job {
     }
 
     /// Unpacks 7z archives (split `.7z.NNN` volumes are read back to back).
-    fn extract_7z(&self, plan: &Plan) -> (Vec<String>, bool) {
+    fn extract_7z(&self, _plan: &Plan) -> (Vec<String>, bool) {
         let mut sets: std::collections::BTreeMap<String, Vec<(u32, PathBuf)>> = Default::default();
-        for &o in &plan.sevenz {
-            let p = plan.paths[o].clone();
+        let mut zvols: Vec<PathBuf> = fs::read_dir(self.work.join(".aux").join("7z")).map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect()).unwrap_or_default();
+        zvols.sort();
+        for p in zvols {
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             match sevenz_volume(&name) {
                 Some((n, base)) => sets.entry(base).or_default().push((n, p)),
@@ -1087,6 +1217,7 @@ impl Job {
         let (mut n, mut bytes) = (0usize, 0u64);
         let mut err: Option<String> = None;
         let mut buf = vec![0u8; 4 << 20];
+        let mut written: Vec<PathBuf> = vec![];
         let r = ar.for_each_entries(|entry, reader| {
             // Entry names come from the archive: never let them escape the job folder.
             let rel = sanitize(&entry.name().replace('\\', "/"));
@@ -1102,6 +1233,7 @@ impl Job {
             if let Some(parent) = dest.parent() {
                 let _ = fs::create_dir_all(parent);
             }
+            written.push(dest.clone());
             let w = (|| -> std::io::Result<u64> {
                 let mut out = File::create(&dest)?;
                 let mut written = 0u64;
@@ -1127,12 +1259,12 @@ impl Job {
                 }
             }
         });
-        if let Some(e) = err {
+        let e = err.or_else(|| r.err().map(|e| e.to_string())).or_else(|| (n == 0).then(|| "archive contains no files".to_string()));
+        if let Some(e) = e {
+            for p in &written {
+                let _ = fs::remove_file(p);
+            }
             return Err(e);
-        }
-        r.map_err(|e| e.to_string())?;
-        if n == 0 {
-            return Err("archive contains no files".into());
         }
         Ok((n, bytes))
     }
@@ -1153,15 +1285,30 @@ impl Job {
         };
         let mut a = arch.open_for_processing().map_err(|e| e.to_string())?;
         let (mut n, mut bytes) = (0, 0);
+        let mut written: Vec<PathBuf> = vec![];
+        // Partial output of a failed unpack is removed so a retry starts clean.
+        let fail = |written: &[PathBuf], e: String| -> Result<(usize, u64), String> {
+            for p in written {
+                let _ = fs::remove_file(p);
+            }
+            Err(e)
+        };
         loop {
-            let Some(h) = a.read_header().map_err(|e| e.to_string())? else { break };
+            let h = match a.read_header() {
+                Ok(Some(h)) => h,
+                Ok(None) => break,
+                Err(e) => return fail(&written, e.to_string()),
+            };
             let e = h.entry();
             if !e.is_file() {
-                a = h.skip().map_err(|e| e.to_string())?;
+                a = match h.skip() {
+                    Ok(a) => a,
+                    Err(e) => return fail(&written, e.to_string()),
+                };
                 continue;
             }
             if e.is_encrypted() && self.password.is_none() {
-                return Err("archive is encrypted and no password was given".into());
+                return fail(&written, "archive is encrypted and no password was given".into());
             }
             // Entry names come from the archive: never let them escape the job folder.
             let raw = e.filename.to_string_lossy().replace('\\', "/");
@@ -1175,7 +1322,11 @@ impl Job {
                 fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
             let size = e.unpacked_size;
-            a = h.extract_to(&dest).map_err(|e| format!("{raw}: {e}"))?;
+            written.push(dest.clone());
+            a = match h.extract_to(&dest) {
+                Ok(a) => a,
+                Err(e) => return fail(&written, format!("{raw}: {e}")),
+            };
             n += 1;
             bytes += size;
         }
@@ -1264,14 +1415,46 @@ impl Job {
     }
 
     fn par2_map(&self, plan: &Plan, set: &Par2Set) -> Vec<Option<VSrc>> {
-        set.recovery_ids
-            .iter()
-            .map(|id| {
-                let fd = &set.files[id];
-                let i = (0..self.files.len())
-                    .find(|&i| plan.ids[i].md5_16k == Some(fd.md5_16k) && plan.ids[i].size == fd.len)
-                    .or_else(|| (0..self.files.len()).find(|&i| plan.ids[i].yname == fd.name || self.files[i].guess == fd.name))?;
-                match plan.targets[i] {
+        let n = self.files.len();
+        let usable = |i: usize| !matches!(plan.targets[i], Target::Skip);
+        let mut used = vec![false; n];
+        let mut pick: Vec<Option<usize>> = vec![None; set.recovery_ids.len()];
+        for (k, id) in set.recovery_ids.iter().enumerate() {
+            let fd = &set.files[id];
+            let i = (0..n)
+                .find(|&i| usable(i) && !used[i] && plan.ids[i].md5_16k == Some(fd.md5_16k) && plan.ids[i].size == fd.len)
+                .or_else(|| (0..n).find(|&i| usable(i) && !used[i] && (plan.ids[i].yname == fd.name || self.files[i].guess == fd.name)));
+            if let Some(i) = i {
+                used[i] = true;
+                pick[k] = Some(i);
+            }
+        }
+        // Files posted under other (obfuscated) names whose first article was lost:
+        // pair them by volume number, or by size, when exactly one file fits.
+        for (k, id) in set.recovery_ids.iter().enumerate() {
+            if pick[k].is_some() {
+                continue;
+            }
+            let fd = &set.files[id];
+            let suf = vol_suffix(&fd.name);
+            let cands: Vec<usize> = (0..n)
+                .filter(|&i| usable(i) && !used[i] && !self.files[i].skip)
+                .filter(|&i| plan.ids[i].size == 0 || plan.ids[i].size == fd.len)
+                .filter(|&i| match &suf {
+                    Some(s) => vol_suffix(&plan.ids[i].yname).as_ref() == Some(s) || vol_suffix(&self.files[i].guess).as_ref() == Some(s),
+                    None => fd.len > 0 && plan.ids[i].size == fd.len,
+                })
+                .collect();
+            if cands.len() == 1 {
+                used[cands[0]] = true;
+                pick[k] = Some(cands[0]);
+            }
+        }
+        pick.iter()
+            .enumerate()
+            .map(|(k, i)| {
+                let fd = &set.files[&set.recovery_ids[k]];
+                match plan.targets[(*i)?] {
                     Target::Plain { out } => Some(VSrc::Out { out, len: fd.len }),
                     Target::Rar { vol } => Some(VSrc::Vol { vol }),
                     Target::Skip => None,
@@ -1399,15 +1582,8 @@ impl Job {
     }
 
     fn try_repair(self: &Arc<Self>, plan: &Plan, allow_fetch: bool) -> RepairOutcome {
-        let files: Vec<Option<File>> = plan.paths.iter().map(|p| open_rw(p).ok()).collect();
-        let mut set = Par2Set::default();
-        for &o in &plan.par2_outs {
-            set.add_file(fs::read(&plan.paths[o]).unwrap_or_default());
-        }
-        let fetched = self.repair.lock().unwrap().paths.clone();
-        for p in &fetched {
-            set.add_file(fs::read(p).unwrap_or_default());
-        }
+        let mut files: Vec<Option<File>> = plan.paths.iter().map(|p| open_rw(&self.cur(p)).ok()).collect();
+        let set = self.load_par2(plan);
         if !set.ready() {
             let already: Vec<u32> = self.repair.lock().unwrap().outs.keys().copied().collect();
             let smallest = self
@@ -1422,10 +1598,35 @@ impl Job {
                 _ => return RepairOutcome::Failed("par2: no usable index (cannot verify or repair)".into()),
             }
         }
-        let map = self.par2_map(plan, &set);
+        let mut map = self.par2_map(plan, &set);
+        // Files the NZB does not have at all are rebuilt from scratch into new files.
+        let aux = self.work.join(".aux");
+        for (k, m) in map.iter_mut().enumerate() {
+            if m.is_some() {
+                continue;
+            }
+            let fd = &set.files[&set.recovery_ids[k]];
+            let dir = if looks_like_rar(&fd.name) {
+                aux.join("rar")
+            } else if looks_like_7z(&fd.name) {
+                aux.join("7z")
+            } else if is_par2_name(&fd.name) {
+                continue;
+            } else {
+                self.work.clone()
+            };
+            let _ = fs::create_dir_all(&dir);
+            let p = dir.join(sanitize(&fd.name));
+            let f = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&p).and_then(|f| f.set_len(fd.len).map(|_| f));
+            if let Ok(f) = f {
+                files.push(Some(f));
+                *m = Some(VSrc::Out { out: files.len() - 1, len: fd.len });
+            }
+        }
         let t0 = Instant::now();
         let (damaged, total) = Self::find_damaged(plan, &files, &set, &map);
         if damaged.is_empty() {
+            self.rename_by_par2(plan, &set, &map);
             return RepairOutcome::Repaired(format!("par2: all {total} slices verified"));
         }
         if set.recv.len() >= damaged.len() {
@@ -1438,6 +1639,9 @@ impl Job {
             if !still.is_empty() {
                 return RepairOutcome::Failed(format!("par2: {} slices still damaged after repair", still.len()));
             }
+            // Leftover archive volumes take the names par2 knows them by, so a set is
+            // never split between two naming schemes when it is unpacked.
+            self.rename_by_par2(plan, &set, &map);
             return RepairOutcome::Repaired(format!(
                 "par2: repaired {}/{total} slices (verify {:.2}s, solve {:.2}s)",
                 damaged.len(),
@@ -1567,12 +1771,44 @@ impl Job {
         if !plan.raw_rar.is_empty() {
             self.phase.store(PH_EXTRACT, Relaxed);
         }
-        let (raw, raw_ok) = self.extract_raw(plan);
-        parts.extend(raw);
+        // Volumes whose names carry no order (obfuscated posts) take par2's names first.
+        if !plan.par2_outs.is_empty() {
+            let unordered = plan.raw_rar.iter().chain(plan.sevenz.iter()).any(|&o| {
+                let n = self.cur(&plan.paths[o]).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                rar::base_name(&n).is_empty() && !looks_like_7z(&n)
+            });
+            if unordered {
+                let set = self.load_par2(plan);
+                if set.ready() {
+                    let map = self.par2_map(plan, &set);
+                    let n = self.rename_by_par2(plan, &set, &map);
+                    if n > 0 {
+                        notes.push(format!("{n} volumes renamed from par2"));
+                    }
+                }
+            }
+        }
+        let (mut raw, mut raw_ok) = self.extract_raw(plan);
         if !plan.sevenz.is_empty() {
             self.phase.store(PH_EXTRACT, Relaxed);
         }
-        let (z, z_ok) = self.extract_7z(plan);
+        let (mut z, mut z_ok) = self.extract_7z(plan);
+        // Unpacking can fail although no article was missing: the NZB may lack whole
+        // files. Let par2 check (and rebuild) everything, then unpack again.
+        let has_par2 = !plan.par2_outs.is_empty() || self.files.iter().any(|f| f.skip);
+        if (!raw_ok || !z_ok) && !repaired && has_par2 {
+            match self.try_repair(plan, stage < 2) {
+                RepairOutcome::Fetching => return,
+                RepairOutcome::Repaired(m) => {
+                    notes.push(format!("{m} (after a failed unpack)"));
+                    self.phase.store(PH_EXTRACT, Relaxed);
+                    (raw, raw_ok) = self.extract_raw(plan);
+                    (z, z_ok) = self.extract_7z(plan);
+                }
+                RepairOutcome::Failed(m) => notes.push(m),
+            }
+        }
+        parts.extend(raw);
         parts.extend(z);
         parts.extend(plan.main.iter().cloned());
         parts.extend(notes);

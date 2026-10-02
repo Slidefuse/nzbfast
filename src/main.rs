@@ -131,6 +131,63 @@ fn main() {
             let mut out = vec![];
             println!("{} bytes; decode: {:?}", body.len(), yenc::decode(&body, &mut out).map(|(i, c)| (i, c, out.len())));
         }
+        "par2check" => {
+            // par2check DIR: verify the files under DIR against the par2 set found there.
+            fn walk(d: &Path, out: &mut Vec<PathBuf>) {
+                for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        walk(&p, out)
+                    } else {
+                        out.push(p)
+                    }
+                }
+            }
+            let mut all = vec![];
+            walk(Path::new(&rest[0]), &mut all);
+            let mut set = par2::Par2Set::default();
+            for p in all.iter().filter(|p| p.to_string_lossy().to_lowercase().ends_with(".par2")) {
+                set.add_file(std::fs::read(p).unwrap_or_default());
+            }
+            let byname: std::collections::HashMap<String, PathBuf> =
+                all.iter().map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), p.clone())).collect();
+            println!("slice {} recovery files {} recovery blocks {}", set.slice, set.recovery_ids.len(), set.recv.len());
+            let (mut total, mut damaged) = (0u64, 0u64);
+            let mut buf = vec![0u8; set.slice as usize];
+            for id in &set.recovery_ids {
+                let Some(fd) = set.files.get(id) else { continue };
+                let n = fd.len.div_ceil(set.slice);
+                let f = byname.get(&fd.name).and_then(|p| std::fs::File::open(p).ok());
+                let mut bad = 0;
+                for j in 0..n {
+                    let ok = match &f {
+                        Some(f) => {
+                            use std::os::unix::fs::FileExt;
+                            let want = ((fd.len - j * set.slice) as usize).min(buf.len());
+                            let mut got = 0;
+                            while got < want {
+                                match f.read_at(&mut buf[got..want], j * set.slice + got as u64) {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(k) => got += k,
+                                }
+                            }
+                            buf[got..].fill(0);
+                            set.ifsc.get(id).and_then(|c| c.get(j as usize)) == Some(&crc32fast::hash(&buf))
+                        }
+                        None => false,
+                    };
+                    if !ok {
+                        bad += 1;
+                    }
+                }
+                total += n;
+                damaged += bad;
+                if bad > 0 {
+                    println!("  {:<60} {bad}/{n} damaged{}", fd.name, if f.is_none() { " (not found)" } else { "" });
+                }
+            }
+            println!("total slices {total}, damaged {damaged}, recovery blocks {}", set.recv.len());
+        }
         "rarcheck" => {
             for f in rest {
                 let b = std::fs::read(f).unwrap();
