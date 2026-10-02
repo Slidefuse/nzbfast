@@ -11,6 +11,7 @@ mod outfile;
 mod par2;
 mod queue;
 mod rar;
+mod sabimport;
 mod stats;
 mod svccfg;
 mod yenc;
@@ -28,6 +29,7 @@ fn usage() -> ! {
     eprintln!(
         "usage:
   nzbfast serve [--config FILE]     (default /etc/nzbfast/nzbfast.toml)
+  nzbfast import-sab [--config FILE] --sab-url URL --sab-incomplete DIR [--dry-run]
   nzbfast get [--sab-ini FILE] [--server SPEC]... [--only a,b] [--tmp DIR] [--done DIR]
               [--active N] [--depth N] [--nic IF] [--limit N] NZB|DIR...
   nzbfast mock-gen --out DIR RELEASE_DIR...
@@ -67,6 +69,28 @@ fn main() {
     match cmd.as_str() {
         "get" => get(rest),
         "serve" => serve(rest),
+        "import-sab" => {
+            let (mut path, mut url, mut inc, mut dry) = ("/etc/nzbfast/nzbfast.toml".to_string(), None, None, false);
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--config" => path = it.next().cloned().unwrap_or_else(|| usage()),
+                    "--sab-url" => url = it.next().cloned(),
+                    "--sab-incomplete" => inc = it.next().cloned(),
+                    "--dry-run" => dry = true,
+                    _ => usage(),
+                }
+            }
+            let (Some(url), Some(inc)) = (url, inc) else { usage() };
+            let l = svccfg::load(&path).unwrap_or_else(|e| {
+                eprintln!("config: {e}");
+                std::process::exit(1)
+            });
+            if let Err(e) = sabimport::run(l, &url, Path::new(&inc), dry) {
+                eprintln!("import-sab: {e}");
+                std::process::exit(1);
+            }
+        }
         "mock-gen" => {
             let mut out = None;
             let mut rels = vec![];

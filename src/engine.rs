@@ -198,9 +198,49 @@ pub struct Engine {
     dirty_s: AtomicBool,
     /// Per server name: day ("YYYY-MM-DD") -> bytes.
     pub daily: Mutex<BTreeMap<String, BTreeMap<String, u64>>>,
+    _lock: File,
 }
 
 pub static TERM: AtomicBool = AtomicBool::new(false);
+
+/// Exclusive lock on the state directory (one process owns queue and history).
+fn lock_state(dir: &Path) -> io::Result<File> {
+    use std::os::unix::io::AsRawFd;
+    fs::create_dir_all(dir)?;
+    let f = OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("lock"))?;
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(io::Error::other(format!("{} is in use by another nzbfast process", dir.display())));
+    }
+    Ok(f)
+}
+
+/// Adds jobs and history entries to the saved state (service must be stopped).
+/// Entries whose id already exists are skipped. Returns the new (queue, history) sizes.
+pub fn import_state(cfg: &SvcCfg, metas: Vec<Meta>, hists: Vec<Hist>) -> io::Result<(usize, usize)> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = &cfg.state_dir;
+    let _lock = lock_state(dir)?;
+    let mut qf: QueueFile = fs::read(dir.join("queue.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let mut hist: Vec<Hist> = fs::read(dir.join("history.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let known: std::collections::HashSet<String> = qf.queue.iter().map(|m| m.nzo.clone()).chain(hist.iter().map(|h| h.m.nzo.clone())).collect();
+    qf.queue.extend(metas.into_iter().filter(|m| !known.contains(&m.nzo)));
+    let mut new_h: Vec<Hist> = hists.into_iter().filter(|h| !known.contains(&h.m.nzo)).collect();
+    new_h.extend(hist);
+    hist = new_h;
+    hist.sort_by_key(|h| std::cmp::Reverse(h.completed));
+    write_atomic(&dir.join("queue.json"), &serde_json::to_vec(&qf)?)?;
+    write_atomic(&dir.join("history.json"), &serde_json::to_vec(&hist)?)?;
+    // Files belong to whoever owns the state directory (the service user).
+    let md = fs::metadata(dir)?;
+    let own = |p: &Path| std::os::unix::fs::chown(p, Some(md.uid()), Some(md.gid()));
+    for p in [dir.join("queue.json"), dir.join("history.json"), dir.join("lock"), dir.join("nzb")] {
+        own(&p)?;
+    }
+    for e in fs::read_dir(dir.join("nzb"))?.flatten() {
+        own(&e.path())?;
+    }
+    Ok((qf.queue.len(), hist.len()))
+}
 
 extern "C" fn on_term(_: libc::c_int) {
     TERM.store(true, Relaxed);
@@ -236,6 +276,7 @@ impl Engine {
         if servers.is_empty() {
             return Err("no servers configured".into());
         }
+        let lock = lock_state(&cfg.state_dir).map_err(|e| e.to_string())?;
         for d in [cfg.state_dir.join("nzb"), cfg.staging_dir.clone()] {
             fs::create_dir_all(&d).map_err(|e| format!("{}: {e}", d.display()))?;
         }
@@ -341,6 +382,7 @@ impl Engine {
             dirty_h: AtomicBool::new(true),
             dirty_s: AtomicBool::new(false),
             daily: Mutex::new(daily),
+            _lock: lock,
         });
         let rx = Arc::new(Mutex::new(move_rx));
         for _ in 0..eng.cfg.mover_jobs.max(1) {
