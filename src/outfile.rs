@@ -6,6 +6,7 @@ use std::alloc::{alloc, dealloc, Layout};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::*};
@@ -14,6 +15,20 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 pub const CHUNK: u64 = 8 << 20;
 const ALIGN: usize = 4096;
+
+#[cfg(target_os = "linux")]
+const O_DIRECT: i32 = libc::O_DIRECT;
+#[cfg(not(target_os = "linux"))]
+const O_DIRECT: i32 = 0;
+
+/// Reserves the file's blocks up front (falls back to a sparse resize).
+fn preallocate(file: &File, size: u64) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, size as i64) } == 0 {
+        return Ok(());
+    }
+    file.set_len(size)
+}
 
 struct ABuf(*mut u8);
 unsafe impl Send for ABuf {}
@@ -102,8 +117,8 @@ impl OutFile {
     pub fn create(path: &Path, size: u64, direct: bool) -> std::io::Result<Arc<OutFile>> {
         let mut o = OpenOptions::new();
         o.create(true).write(true).read(true).truncate(true);
-        let (file, direct) = if direct && size > 0 {
-            match OpenOptions::new().create(true).write(true).read(true).truncate(true).custom_flags(libc::O_DIRECT).open(path) {
+        let (file, direct) = if direct && size > 0 && O_DIRECT != 0 {
+            match OpenOptions::new().create(true).write(true).read(true).truncate(true).custom_flags(O_DIRECT).open(path) {
                 Ok(f) => (f, true),
                 Err(_) => (o.open(path)?, false),
             }
@@ -111,11 +126,7 @@ impl OutFile {
             (o.open(path)?, false)
         };
         if size > 0 {
-            unsafe {
-                if libc::fallocate(file.as_raw_fd(), 0, 0, size as i64) != 0 {
-                    file.set_len(size)?;
-                }
-            }
+            preallocate(&file, size)?;
         }
         Ok(Arc::new(OutFile { file, size, direct, chunks: Mutex::new(HashMap::new()), write_errors: AtomicUsize::new(0) }))
     }

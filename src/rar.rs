@@ -17,6 +17,9 @@ pub struct RarVol {
     pub encrypted: bool,
     pub split_before: bool,
     pub split_after: bool,
+    /// Volumes are named `x.partNN.rar` (RAR5, or RAR4 with the new-numbering flag)
+    /// rather than `x.rar`, `x.r00`, ...
+    pub new_numbering: bool,
 }
 
 pub const SIG4: &[u8] = b"Rar!\x1a\x07\x00";
@@ -53,16 +56,18 @@ fn vint(b: &[u8], p: &mut usize) -> Option<u64> {
 /// Parses the headers at the start of a volume up to and including the first file header.
 pub fn parse_volume(b: &[u8]) -> Option<RarVol> {
     if b.starts_with(SIG5) {
-        parse5(b)
+        parse5(b, SIG5.len())
     } else if b.starts_with(SIG4) {
-        parse4(b)
+        parse4(b, SIG4.len(), false)
     } else {
         None
     }
 }
 
-fn parse4(b: &[u8]) -> Option<RarVol> {
-    let mut p = SIG4.len();
+/// Parses headers from `start` up to and including the next file header.
+fn parse4(b: &[u8], start: usize, newnum: bool) -> Option<RarVol> {
+    let mut p = start;
+    let mut newnum = newnum;
     for _ in 0..16 {
         let typ = *b.get(p + 2)?;
         let flags = u16le(b, p + 3)?;
@@ -72,8 +77,9 @@ fn parse4(b: &[u8]) -> Option<RarVol> {
         }
         match typ {
             0x73 => {
+                newnum = flags & 0x0010 != 0;
                 if flags & 0x0080 != 0 {
-                    return Some(encrypted(false));
+                    return Some(encrypted(false, newnum));
                 }
             }
             0x74 => {
@@ -103,6 +109,7 @@ fn parse4(b: &[u8]) -> Option<RarVol> {
                     encrypted: flags & 0x04 != 0,
                     split_before: flags & 0x01 != 0,
                     split_after: flags & 0x02 != 0,
+                    new_numbering: newnum,
                 });
             }
             _ => {}
@@ -113,7 +120,7 @@ fn parse4(b: &[u8]) -> Option<RarVol> {
     None
 }
 
-fn encrypted(rar5: bool) -> RarVol {
+fn encrypted(rar5: bool, new_numbering: bool) -> RarVol {
     RarVol {
         rar5,
         vol_num: None,
@@ -126,11 +133,12 @@ fn encrypted(rar5: bool) -> RarVol {
         encrypted: true,
         split_before: false,
         split_after: false,
+        new_numbering,
     }
 }
 
-fn parse5(b: &[u8]) -> Option<RarVol> {
-    let mut p = SIG5.len();
+fn parse5(b: &[u8], start: usize) -> Option<RarVol> {
+    let mut p = start;
     let mut vol_num = Some(0);
     for _ in 0..16 {
         let hstart = p;
@@ -149,7 +157,7 @@ fn parse5(b: &[u8]) -> Option<RarVol> {
                     vol_num = Some(vint(b, &mut p)?);
                 }
             }
-            4 => return Some(encrypted(true)),
+            4 => return Some(encrypted(true, true)),
             2 => {
                 let fflags = vint(b, &mut p)?;
                 let unp = vint(b, &mut p)?;
@@ -194,6 +202,7 @@ fn parse5(b: &[u8]) -> Option<RarVol> {
                     encrypted: enc,
                     split_before: hflags & 0x08 != 0,
                     split_after: hflags & 0x10 != 0,
+                    new_numbering: true,
                 });
             }
             _ => {}
@@ -221,4 +230,97 @@ pub fn name_order(name: &str) -> Option<u64> {
         return Some(base + n);
     }
     None
+}
+
+/// Archive name without its volume suffix (`x.part01.rar`, `x.rar`, `x.r00` -> `x`),
+/// lowercased; empty when the name does not look like a RAR volume (obfuscated posts).
+pub fn base_name(name: &str) -> String {
+    let l = name.to_ascii_lowercase();
+    if let Some(stem) = l.strip_suffix(".rar") {
+        if let Some(i) = stem.rfind(".part") {
+            if !stem[i + 5..].is_empty() && stem[i + 5..].bytes().all(|c| c.is_ascii_digit()) {
+                return stem[..i].to_string();
+            }
+        }
+        return stem.to_string();
+    }
+    if let Some((stem, ext)) = l.rsplit_once('.') {
+        if ext.len() == 3 && (ext.starts_with('r') || ext.starts_with('s')) && ext[1..].bytes().all(|c| c.is_ascii_digit()) {
+            return stem.to_string();
+        }
+    }
+    String::new()
+}
+
+/// Canonical name of volume `i` (0-based) so the UnRAR library finds each next volume.
+pub fn volume_name(i: usize, total: usize, new_numbering: bool) -> String {
+    if new_numbering {
+        let w = total.to_string().len().max(3);
+        format!("v.part{:0w$}.rar", i + 1)
+    } else if i == 0 {
+        "v.rar".into()
+    } else {
+        let j = i - 1;
+        format!("v.{}{:02}", (b'r' + (j / 100) as u8) as char, j % 100)
+    }
+}
+
+/// RAR4 volume number (0-based) from the end-of-archive header at the end of a volume,
+/// for ordering volumes whose names were obfuscated.
+pub fn rar4_end_volnum(tail: &[u8]) -> Option<u64> {
+    // ENDARC: crc16, type 0x7b, flags, size [, data crc] [, volume number]
+    for p in (0..tail.len().saturating_sub(6)).rev() {
+        if tail[p + 2] != 0x7b {
+            continue;
+        }
+        let flags = u16le(tail, p + 3)?;
+        let size = u16le(tail, p + 5)? as usize;
+        if size < 7 || p + size > tail.len() || flags & 0x0008 == 0 {
+            continue;
+        }
+        let crc = u16le(tail, p)? as u32;
+        if crc32fast::hash(&tail[p + 2..p + size]) & 0xffff != crc {
+            continue;
+        }
+        let at = p + 7 + if flags & 0x0002 != 0 { 4 } else { 0 };
+        return u16le(tail, at);
+    }
+    None
+}
+
+/// A small file stored after the main file in the last volume of a set.
+pub struct TailFile {
+    pub name: String,
+    pub data: std::ops::Range<usize>,
+    pub crc: Option<u32>,
+    pub stored: bool,
+    pub complete: bool,
+}
+
+/// Lists the files whose headers follow the main file's data (`tail` starts right
+/// after that data), e.g. subtitles packed into the same archive.
+pub fn tail_files(tail: &[u8], rar5: bool) -> Vec<TailFile> {
+    let mut out = vec![];
+    let mut pos = 0;
+    while pos < tail.len() && out.len() < 64 {
+        let v = if rar5 { parse5(tail, pos) } else { parse4(tail, pos, false) };
+        let Some(v) = v else { break };
+        if v.encrypted || v.inner_name.is_empty() {
+            break;
+        }
+        let a = v.data_start as usize;
+        let b = a.saturating_add(v.pack_size as usize);
+        out.push(TailFile {
+            name: v.inner_name.clone(),
+            data: a.min(tail.len())..b.min(tail.len()),
+            crc: v.data_crc,
+            stored: v.stored,
+            complete: b <= tail.len() && !v.split_after && !v.split_before && v.pack_size == v.unp_size,
+        });
+        if b <= pos {
+            break;
+        }
+        pos = b;
+    }
+    out
 }

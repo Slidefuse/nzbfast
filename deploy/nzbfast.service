@@ -1,0 +1,22 @@
+[Unit]
+Description=nzbfast Usenet downloader (SABnzbd-compatible API + web UI)
+Wants=network-online.target
+After=network-online.target remote-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nzbfast serve --config /etc/nzbfast/nzbfast.toml
+# Run as the user that owns the download folders (the one Sonarr/Radarr run as).
+User=nzbfast
+Group=nzbfast
+UMask=0002
+Restart=always
+RestartSec=3
+# Queue and history are saved on SIGTERM.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+LimitNOFILE=1048576
+TasksMax=infinity
+
+[Install]
+WantedBy=multi-user.target

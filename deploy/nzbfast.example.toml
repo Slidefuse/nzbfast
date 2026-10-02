@@ -1,0 +1,61 @@
+# nzbfast service configuration (nzbfast serve --config /etc/nzbfast/nzbfast.toml)
+#
+# nzbfast speaks the SABnzbd API, so Sonarr, Radarr and Prowlarr use their stock
+# "SABnzbd" download client. Point them at `listen` with the same API key and
+# category names as before.
+
+listen = "0.0.0.0:8085"   # or several: "127.0.0.1:8085,172.18.0.1:8085"
+
+# Import servers, categories, API keys and complete_dir from an existing SABnzbd ini.
+# Anything set explicitly below takes precedence.
+sab_ini = "/path/to/sabnzbd.ini"
+# api_key = "..."            # defaults to SABnzbd's api_key, else generated
+# nzb_key = "..."            # add-only key
+
+state_dir = "/var/lib/nzbfast"            # queue, history, stored NZBs
+staging_dir = "/dev/shm/nzbfast"          # fast scratch (RAM or NVMe)
+# complete_dir = "/mnt/media/downloads/complete"   # final tier (e.g. NFS)
+
+# Bytes held in staging (active downloads + jobs waiting for the mover). New jobs
+# wait when the budget is used up, so a slow final tier throttles downloading
+# instead of filling RAM.
+staging_limit_gb = 64
+
+active_jobs = 256        # jobs downloading at once (small jobs need many to fill the pipe)
+depth = 8                # pipelined BODY requests per connection
+nic = "eth0"             # interface shown as "NIC" in the UI
+io_threads = 8
+mover_jobs = 2           # jobs copied to complete_dir at once
+mover_threads = 4        # parallel range copies per file
+history_keep = 20000
+ui_auth = true           # web UI asks for the API key once (then a cookie)
+# speed_limit_mbs = 0    # initial limit in MB/s (0 = unlimited)
+
+# Adjust imported servers (matched by name or host substring), or add new ones
+# (no `match`). `connect` dials another address (e.g. a TCP relay) while TLS
+# still verifies `host`.
+# [[servers]]
+# match = "eweka"
+# connect = "198.51.100.7:5631"
+#
+# [[servers]]
+# name = "Backup"
+# host = "news.example.com"
+# port = 563
+# tls = true
+# user = "..."
+# pass = "..."
+# conns = 20
+# prio = 1
+# enable = true
+
+# Extra or replacement categories (dir is relative to complete_dir).
+# [[categories]]
+# name = "tv"
+# dir = "tv"
+
+# Rewrite reported paths for clients that mount the folders elsewhere,
+# e.g. Sonarr in a container that sees /mnt/media/downloads as /downloads.
+# [[path_map]]
+# from = "/mnt/media/downloads"
+# to = "/downloads"

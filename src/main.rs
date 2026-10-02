@@ -1,13 +1,18 @@
+mod api;
 mod config;
-mod gf16;
-mod par2;
 mod conn;
+mod engine;
+mod gf16;
+mod http;
 mod job;
 mod mock;
 mod nzb;
 mod outfile;
+mod par2;
 mod queue;
 mod rar;
+mod stats;
+mod svccfg;
 mod yenc;
 mod ysimd;
 
@@ -22,6 +27,7 @@ use std::time::{Duration, Instant};
 fn usage() -> ! {
     eprintln!(
         "usage:
+  nzbfast serve [--config FILE]     (default /etc/nzbfast/nzbfast.toml)
   nzbfast get [--sab-ini FILE] [--server SPEC]... [--only a,b] [--tmp DIR] [--done DIR]
               [--active N] [--depth N] [--nic IF] [--limit N] NZB|DIR...
   nzbfast mock-gen --out DIR RELEASE_DIR...
@@ -60,6 +66,7 @@ fn main() {
     let rest = &args[1..];
     match cmd.as_str() {
         "get" => get(rest),
+        "serve" => serve(rest),
         "mock-gen" => {
             let mut out = None;
             let mut rels = vec![];
@@ -116,6 +123,53 @@ fn main() {
             }
         }
         _ => usage(),
+    }
+}
+
+fn serve(args: &[String]) {
+    let mut path = "/etc/nzbfast/nzbfast.toml".to_string();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--config" => path = it.next().cloned().unwrap_or_else(|| usage()),
+            _ => usage(),
+        }
+    }
+    let mut l = svccfg::load(&path).unwrap_or_else(|e| {
+        eprintln!("config: {e}");
+        std::process::exit(1)
+    });
+    if l.cfg.api_key.is_empty() {
+        // No key configured or imported: generate one and keep it across restarts.
+        let kf = l.cfg.state_dir.join("api_key");
+        l.cfg.api_key = std::fs::read_to_string(&kf).map(|s| s.trim().to_string()).unwrap_or_default();
+        if l.cfg.api_key.is_empty() {
+            let mut b = [0u8; 16];
+            use std::io::Read;
+            let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b));
+            l.cfg.api_key = b.iter().map(|x| format!("{x:02x}")).collect();
+            let _ = std::fs::create_dir_all(&l.cfg.state_dir);
+            let _ = std::fs::write(&kf, &l.cfg.api_key);
+            eprintln!("generated API key (stored in {})", kf.display());
+        }
+    }
+    let listen = l.cfg.listen.clone();
+    let eng = engine::Engine::start(l).unwrap_or_else(|e| {
+        eprintln!("start: {e}");
+        std::process::exit(1)
+    });
+    let hub = stats::Hub::start(eng.clone());
+    let handler = api::handler(eng.clone(), hub);
+    // Several addresses may be given, e.g. loopback plus a Docker bridge gateway.
+    for addr in listen.split(',').map(str::trim).filter(|a| !a.is_empty()) {
+        if let Err(e) = http::serve(addr, handler.clone()) {
+            eprintln!("listen {addr}: {e}");
+            std::process::exit(1);
+        }
+        eprintln!("nzbfast {} serving SABnzbd API + UI on http://{addr}/", env!("CARGO_PKG_VERSION"));
+    }
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
     }
 }
 
@@ -245,6 +299,9 @@ fn get(args: &[String]) {
             while !stop.load(Relaxed) {
                 std::thread::sleep(Duration::from_secs(1));
                 sec += 1;
+                for w in q.sweep() {
+                    w.job.on_missing(w.file, w.seg, &q);
+                }
                 let mut tot = 0u64;
                 let mut parts = String::new();
                 for (i, s) in stats.iter().enumerate() {
@@ -295,8 +352,10 @@ fn get(args: &[String]) {
             match nzb::load(&path) {
                 Ok(n) => {
                     active.fetch_add(1, Relaxed);
-                    let job = Job::new(next, n, &tmp, &done, finished.clone());
-                    q.push_front(job.probe_work());
+                    let (work, fin) = (tmp.join(&n.name), done.join(&n.name));
+                    let job = Job::new(next, n, work, Some(fin), finished.clone());
+                    let w = job.probe_work();
+                    job.enqueue(&q, w, true);
                 }
                 Err(e) => eprintln!("skip {path}: {e}"),
             }
@@ -371,7 +430,10 @@ fn bench() {
     let avail: Vec<_> = kinds
         .iter()
         .copied()
-        .filter(|k| *k != ysimd::Kind::Avx512 || std::is_x86_feature_detected!("avx512vbmi2"))
+        .filter(|k| match k {
+            ysimd::Kind::Scalar => true,
+            _ => ysimd::supported(*k),
+        })
         .collect();
     for t in 0..2000u64 {
         let len = (t * 7919 % 5000) as usize + (t % 3) as usize;

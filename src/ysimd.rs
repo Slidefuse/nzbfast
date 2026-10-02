@@ -157,6 +157,22 @@ pub enum Kind {
     Avx512,
 }
 
+/// Whether the CPU can run the given implementation.
+pub fn supported(kind: Kind) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match kind {
+            Kind::Scalar => true,
+            Kind::Ssse3 => is_x86_feature_detected!("ssse3") && is_x86_feature_detected!("sse4.1"),
+            Kind::Avx512 => is_x86_feature_detected!("avx512vbmi2") && is_x86_feature_detected!("avx512bw"),
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        kind == Kind::Scalar
+    }
+}
+
 pub fn best() -> Kind {
     static K: OnceLock<Kind> = OnceLock::new();
     *K.get_or_init(|| {

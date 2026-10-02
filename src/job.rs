@@ -110,11 +110,23 @@ struct JState {
     pieces: Vec<Piece>,
 }
 
+/// What a job is doing right now (for status displays).
+pub const PH_PROBE: u8 = 0;
+pub const PH_DOWNLOAD: u8 = 1;
+pub const PH_VERIFY: u8 = 2;
+pub const PH_REPAIR: u8 = 3;
+pub const PH_PAR2: u8 = 4;
+pub const PH_EXTRACT: u8 = 5;
+pub const PH_DONE: u8 = 6;
+
 pub struct Job {
     pub id: usize,
     pub name: String,
     pub work: PathBuf,
-    pub done_dir: PathBuf,
+    /// Where the finished job is renamed to; `None` leaves it in `work`.
+    pub done_dir: Option<PathBuf>,
+    /// Password for encrypted archives (from the NZB or the job name).
+    pub password: Option<String>,
     pub files: Vec<JFile>,
     state: Mutex<JState>,
     plan: OnceLock<Plan>,
@@ -127,7 +139,15 @@ pub struct Job {
     recoverable: AtomicU64,
     pub bytes_total: u64,
     pub bytes_done: AtomicU64,
+    /// Progress in NZB (encoded) bytes: segments handled (downloaded or given up on)
+    /// versus segments scheduled, including recovery volumes fetched for a repair.
+    pub enc_total: AtomicU64,
+    pub enc_done: AtomicU64,
     pub missing: AtomicUsize,
+    pub phase: AtomicU8,
+    cancelled: AtomicBool,
+    /// `Some` while paused: work items held back from the queue.
+    parked: Mutex<Option<Vec<Work>>>,
     pub started: Instant,
     pub finished: Arc<dyn Fn(&Job, JobResult) + Send + Sync>,
 }
@@ -135,6 +155,7 @@ pub struct Job {
 pub struct JobResult {
     pub ok: bool,
     pub summary: String,
+    pub parts: Vec<String>,
 }
 
 enum RepairOutcome {
@@ -153,7 +174,7 @@ fn is_par2_name(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with(".par2")
 }
 
-fn is_par2_volume(name: &str) -> bool {
+pub fn is_par2_volume(name: &str) -> bool {
     is_par2_name(name) && name.to_ascii_lowercase().contains(".vol")
 }
 
@@ -225,8 +246,8 @@ impl Job {
     pub fn new(
         id: usize,
         nzb: Nzb,
-        tmp: &Path,
-        done: &Path,
+        work: PathBuf,
+        done_dir: Option<PathBuf>,
         finished: Arc<dyn Fn(&Job, JobResult) + Send + Sync>,
     ) -> Arc<Job> {
         let files: Vec<JFile> = nzb
@@ -246,8 +267,9 @@ impl Job {
         let recoverable = if files.iter().any(|f| is_par2_name(&f.guess)) { named_par2 } else { u64::MAX };
         Arc::new(Job {
             id,
-            work: tmp.join(&nzb.name),
-            done_dir: done.join(&nzb.name),
+            work,
+            done_dir,
+            password: nzb.password,
             name: nzb.name,
             state: Mutex::new(JState { missing_files: Default::default(), probes_left, probes: files.iter().map(|_| None).collect(), pieces: vec![] }),
             files,
@@ -261,10 +283,66 @@ impl Job {
             recoverable: AtomicU64::new(recoverable),
             bytes_total,
             bytes_done: AtomicU64::new(0),
+            enc_total: AtomicU64::new(bytes_total),
+            enc_done: AtomicU64::new(0),
             missing: AtomicUsize::new(0),
+            phase: AtomicU8::new(PH_PROBE),
+            cancelled: AtomicBool::new(false),
+            parked: Mutex::new(None),
             started: Instant::now(),
             finished,
         })
+    }
+
+    /// Queues work for this job, or holds it back while the job is paused.
+    pub fn enqueue(self: &Arc<Self>, q: &Queues, items: Vec<Work>, front: bool) {
+        if items.is_empty() {
+            return;
+        }
+        let mut p = self.parked.lock().unwrap();
+        if let Some(v) = p.as_mut() {
+            v.extend(items);
+        } else if front {
+            q.push_front(items);
+        } else {
+            q.push_back(items);
+        }
+    }
+
+    pub fn pause(self: &Arc<Self>, q: &Queues) {
+        let mut p = self.parked.lock().unwrap();
+        if p.is_none() {
+            *p = Some(q.purge(self));
+        }
+    }
+
+    pub fn resume(self: &Arc<Self>, q: &Queues) {
+        let items = self.parked.lock().unwrap().take();
+        if let Some(v) = items {
+            q.push_front(v);
+        }
+    }
+
+    /// Stops the job: queued work is dropped, in-flight articles are discarded as they
+    /// arrive, and `finished` is still called once all I/O has drained.
+    pub fn cancel(self: &Arc<Self>, q: &Queues) {
+        self.cancelled.store(true, Relaxed);
+        self.aborted.store(true, Relaxed);
+        let mut items = q.purge(self);
+        if let Some(v) = self.parked.lock().unwrap().take() {
+            items.extend(v);
+        }
+        for w in items {
+            self.drop_work(w.file, w.seg, q);
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Relaxed)
+    }
+
+    fn seg_bytes(&self, file: u32, seg: u32) -> u64 {
+        self.files[file as usize].segs[seg as usize].bytes as u64
     }
 
     /// Work items for the probe phase (first article of every wanted file).
@@ -276,7 +354,8 @@ impl Job {
             }
         }
         if v.is_empty() {
-            (self.finished)(self, JobResult { ok: false, summary: "no downloadable files".into() });
+            self.phase.store(PH_DONE, Relaxed);
+            (self.finished)(self, JobResult { ok: false, summary: "no downloadable files".into(), parts: vec!["no downloadable files".into()] });
         }
         v
     }
@@ -291,6 +370,7 @@ impl Job {
 
     pub fn on_article(self: &Arc<Self>, file: u32, seg: u32, info: &YInfo, data: &[u8], crc: u32, q: &Queues) {
         self.bytes_done.fetch_add(data.len() as u64, Relaxed);
+        self.enc_done.fetch_add(self.seg_bytes(file, seg), Relaxed);
         if seg == 0 && self.plan.get().is_none() {
             self.on_probe(file, Some(Probe { info: info.clone(), data: data.to_vec(), crc }), q);
             return;
@@ -312,6 +392,7 @@ impl Job {
 
     /// Accounts for a work item without downloading it (missing or job aborted).
     pub fn drop_work(self: &Arc<Self>, file: u32, seg: u32, q: &Queues) {
+        self.enc_done.fetch_add(self.seg_bytes(file, seg), Relaxed);
         if seg == 0 && self.plan.get().is_none() {
             self.on_probe(file, None, q);
         } else {
@@ -363,15 +444,26 @@ impl Job {
             rest.clear();
             remaining = 0;
         }
+        // Segments that will never be requested count as handled for progress.
+        let skipped: u64 = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(i, f)| !f.skip && (rest.is_empty() || matches!(plan.targets[*i], Target::Skip)))
+            .flat_map(|(_, f)| f.segs.iter().skip(1))
+            .map(|s| s.bytes as u64)
+            .sum();
+        self.enc_done.fetch_add(skipped, Relaxed);
         // +1 guard so the job cannot finish while probes are still being written.
         self.remaining.store(remaining + 1, Relaxed);
         let _ = self.plan.set(plan);
+        self.phase.store(PH_DOWNLOAD, Relaxed);
         for (i, p) in probes.iter().enumerate() {
             if let Some(p) = p {
                 self.apply(i as u32, &p.info, &p.data, p.crc);
             }
         }
-        q.push_back(rest);
+        self.enqueue(q, rest, false);
         self.segment_done();
     }
 
@@ -491,7 +583,7 @@ impl Job {
                         targets.push(Target::Skip); // replaced below
                         continue;
                     }
-                    notes.push(format!("{name}: {} archive, kept as volume", if v.encrypted { "encrypted" } else { "compressed" }));
+                    notes.push(format!("{name}: {} archive, unpacked after download", if v.encrypted { "encrypted" } else { "compressed" }));
                 }
                 let t = make(&aux.join("rar"), &name, p.info.size, &mut outs, &mut paths);
                 if let Target::Plain { out } = t {
@@ -520,6 +612,7 @@ impl Job {
         }
         let mut vols = vec![];
         let mut sets = vec![];
+        let mut checked = vec![];
         for (inner, mut g) in groups {
             let all5 = g.iter().all(|c| c.1.vol_num.is_some());
             let keyed: Option<Vec<u64>> =
@@ -540,8 +633,17 @@ impl Job {
                 }
                 ok && sum == g[0].1.unp_size
             };
-            if !valid {
-                notes.push(format!("{inner}: RAR set incomplete or unordered, kept as volumes"));
+            checked.push((inner, g, valid));
+        }
+        // One odd set (typically an archive holding several large files, whose later
+        // files start mid-volume) means volumes cannot be mapped file by file: keep them
+        // all and unpack after the download.
+        let all_valid = checked.iter().all(|c| c.2);
+        if !all_valid {
+            notes.push("RAR layout not streamable (several files or incomplete set): unpacking after download".into());
+        }
+        for (inner, g, _) in checked {
+            if !all_valid {
                 for c in g {
                     let t = make(&aux.join("rar"), &c.3, c.2, &mut outs, &mut paths);
                     if let Target::Plain { out } = t {
@@ -658,15 +760,49 @@ impl Job {
         (res, all_ok)
     }
 
-    /// Extracts stored RAR sets that had to be downloaded as volumes; volumes that
-    /// cannot be extracted in-process are kept.
+    /// Writes small stored files that follow the main file in a set's last volume
+    /// (subtitles, nfo) from the bytes kept for par2 verification.
+    fn extract_tail_files(&self, plan: &Plan) -> Vec<String> {
+        let mut res = vec![];
+        for set in &plan.sets {
+            let Some(&last) = set.vols.last() else { continue };
+            let vm = &plan.vols[last];
+            let tail = vm.tail.lock().unwrap().clone();
+            for f in rar::tail_files(&tail, vm.info.rar5) {
+                if !f.stored || !f.complete {
+                    res.push(format!("{}: not extracted (packed after the main file)", f.name));
+                    continue;
+                }
+                let data = &tail[f.data.clone()];
+                if f.crc.is_some_and(|c| c != crc32fast::hash(data)) {
+                    res.push(format!("{}: CRC mismatch, skipped", f.name));
+                    continue;
+                }
+                let dst = self.work.join(sanitize(&self.output_name(&f.name)));
+                if let Some(parent) = dst.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                match fs::write(&dst, data) {
+                    Ok(()) => res.push(format!("{} extracted", f.name)),
+                    Err(e) => res.push(format!("{}: {e}", f.name)),
+                }
+            }
+        }
+        res
+    }
+
+    /// Extracts RAR sets that had to be downloaded as volumes: stored sets by copying
+    /// their payload, anything else (compressed, encrypted) with the UnRAR library.
     fn extract_raw(&self, plan: &Plan) -> (Vec<String>, bool) {
         let mut res = vec![];
         let mut ok = true;
         let mut groups: HashMap<String, Vec<(PathBuf, RarVol, u64)>> = HashMap::new();
-        let mut keep: Vec<PathBuf> = vec![];
+        let mut others: Vec<(PathBuf, Option<RarVol>, usize)> = vec![];
+        let nzb_order = |o: usize| plan.targets.iter().position(|t| matches!(t, Target::Plain { out } if *out == o)).unwrap_or(usize::MAX);
+        let mut order: HashMap<PathBuf, usize> = HashMap::new();
         for &o in &plan.raw_rar {
             let p = &plan.paths[o];
+            order.insert(p.clone(), nzb_order(o));
             let mut head = vec![0u8; 65536];
             let n = File::open(p).and_then(|mut f| f.read(&mut head)).unwrap_or(0);
             head.truncate(n);
@@ -675,23 +811,34 @@ impl Job {
                     let size = fs::metadata(p).map(|m| m.len()).unwrap_or(0);
                     groups.entry(v.inner_name.clone()).or_default().push((p.clone(), v, size));
                 }
-                _ => keep.push(p.clone()),
+                v => others.push((p.clone(), v, nzb_order(o))),
             }
         }
-        for (inner, mut g) in groups {
+        for g in groups.values_mut() {
             let all5 = g.iter().all(|c| c.1.vol_num.is_some());
             g.sort_by_key(|c| if all5 { c.1.vol_num.unwrap() } else { rar::name_order(&c.0.to_string_lossy()).unwrap_or(u64::MAX) });
+        }
+        // Stored volumes can be copied file by file only if every file starts in its own
+        // volume; otherwise (several files per archive) the library unpacks them.
+        let clean = groups.values().all(|g| {
+            g.iter().map(|c| c.1.pack_size).sum::<u64>() == g[0].1.unp_size && !g[0].1.split_before && !g.last().unwrap().1.split_after
+        });
+        if !clean {
+            for (_, g) in groups.drain() {
+                for (p, v, _) in g {
+                    let k = order.get(&p).copied().unwrap_or(usize::MAX);
+                    others.push((p, Some(v), k));
+                }
+            }
+        }
+        for (inner, g) in groups {
             let total: u64 = g.iter().map(|c| c.1.pack_size).sum();
             if total != g[0].1.unp_size || g[0].1.split_before || g.last().unwrap().1.split_after {
                 res.push(format!("{inner} FAILED: incomplete RAR set ({} volumes)", g.len()));
                 ok = false;
                 continue;
             }
-            let name = if is_video(&inner) && is_obfuscated(&inner) {
-                format!("{}.{}", self.name, inner.rsplit('.').next().unwrap_or("mkv"))
-            } else {
-                inner.clone()
-            };
+            let name = self.output_name(&inner);
             let dst = self.work.join(sanitize(&name));
             let r = (|| -> std::io::Result<Option<String>> {
                 if let Some(parent) = dst.parent() {
@@ -741,14 +888,125 @@ impl Job {
                 }
             }
         }
-        for p in keep {
-            // Compressed/encrypted archives: hand the volumes over as-is.
-            if let Some(n) = p.file_name() {
-                let _ = fs::rename(&p, self.work.join(n));
+        if !others.is_empty() {
+            match self.unrar_all(others) {
+                Ok(msgs) => res.extend(msgs),
+                Err(e) => {
+                    res.insert(0, format!("Unpacking failed: {e}"));
+                    ok = false;
+                }
             }
-            res.push(format!("{} kept (compressed/encrypted RAR)", p.file_name().unwrap_or_default().to_string_lossy()));
         }
         (res, ok)
+    }
+
+    /// Output name for an extracted file: obfuscated video names become the job name.
+    fn output_name(&self, inner: &str) -> String {
+        if is_video(inner) && is_obfuscated(inner) {
+            format!("{}.{}", self.name, inner.rsplit('.').next().unwrap_or("mkv"))
+        } else {
+            inner.to_string()
+        }
+    }
+
+    /// Unpacks compressed/encrypted RAR volumes. Volumes are hard-linked under canonical
+    /// names (`v.part001.rar` or `v.rar`/`v.r00`) so the library can walk the set even
+    /// when the posted names are obfuscated.
+    fn unrar_all(&self, vols: Vec<(PathBuf, Option<RarVol>, usize)>) -> Result<Vec<String>, String> {
+        let mut sets: std::collections::BTreeMap<String, Vec<(PathBuf, Option<RarVol>, usize)>> = Default::default();
+        for v in vols {
+            let name = v.0.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            sets.entry(rar::base_name(&name)).or_default().push(v);
+        }
+        let mut msgs = vec![];
+        for (k, (base, mut g)) in sets.into_iter().enumerate() {
+            let fname = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if g.iter().all(|x| x.1.as_ref().is_some_and(|v| v.rar5 && !v.encrypted && v.vol_num.is_some())) {
+                g.sort_by_key(|x| x.1.as_ref().and_then(|v| v.vol_num));
+            } else if g.iter().all(|x| rar::name_order(&fname(&x.0)).is_some()) {
+                g.sort_by_key(|x| rar::name_order(&fname(&x.0)));
+            } else {
+                let tails: Vec<Option<u64>> = g.iter().map(|x| Self::rar4_volnum(&x.0)).collect();
+                if tails.iter().all(|t| t.is_some()) {
+                    let mut idx: Vec<usize> = (0..g.len()).collect();
+                    idx.sort_by_key(|&i| tails[i]);
+                    let mut sorted = Vec::with_capacity(g.len());
+                    let mut old: Vec<Option<(PathBuf, Option<RarVol>, usize)>> = g.into_iter().map(Some).collect();
+                    for i in idx {
+                        sorted.push(old[i].take().unwrap());
+                    }
+                    g = sorted;
+                } else {
+                    // Posting order usually matches volume order.
+                    g.sort_by_key(|x| x.2);
+                }
+            }
+            let newnum = g.iter().find_map(|x| x.1.as_ref().map(|v| v.new_numbering)).unwrap_or(true);
+            let dir = self.work.join(".aux").join(format!("unrar{k}"));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            for (i, x) in g.iter().enumerate() {
+                let d = dir.join(rar::volume_name(i, g.len(), newnum));
+                fs::hard_link(&x.0, &d).or_else(|_| fs::rename(&x.0, &d)).map_err(|e| format!("staging volume: {e}"))?;
+            }
+            let first = dir.join(rar::volume_name(0, g.len(), newnum));
+            let label = if base.is_empty() { "obfuscated set".to_string() } else { base.clone() };
+            let (n, bytes) = self.unrar_one(&first).map_err(|e| format!("{label}: {e}"))?;
+            msgs.push(format!("unpacked {n} file(s), {:.2} GB from {} RAR volumes ({label})", bytes as f64 / 1e9, g.len()));
+            let _ = fs::remove_dir_all(&dir);
+            for x in &g {
+                let _ = fs::remove_file(&x.0);
+            }
+        }
+        Ok(msgs)
+    }
+
+    fn rar4_volnum(p: &Path) -> Option<u64> {
+        let f = File::open(p).ok()?;
+        let len = f.metadata().ok()?.len();
+        let n = len.min(64) as usize;
+        let mut tail = vec![0u8; n];
+        f.read_exact_at(&mut tail, len - n as u64).ok()?;
+        rar::rar4_end_volnum(&tail)
+    }
+
+    fn unrar_one(&self, first: &Path) -> Result<(usize, u64), String> {
+        let arch = match &self.password {
+            Some(p) => unrar::Archive::with_password(first, p.as_bytes()),
+            None => unrar::Archive::new(first),
+        };
+        let mut a = arch.open_for_processing().map_err(|e| e.to_string())?;
+        let (mut n, mut bytes) = (0, 0);
+        loop {
+            let Some(h) = a.read_header().map_err(|e| e.to_string())? else { break };
+            let e = h.entry();
+            if !e.is_file() {
+                a = h.skip().map_err(|e| e.to_string())?;
+                continue;
+            }
+            if e.is_encrypted() && self.password.is_none() {
+                return Err("archive is encrypted and no password was given".into());
+            }
+            // Entry names come from the archive: never let them escape the job folder.
+            let raw = e.filename.to_string_lossy().replace('\\', "/");
+            let rel = sanitize(&raw);
+            let rel = match rel.file_name() {
+                Some(f) => rel.with_file_name(self.output_name(&f.to_string_lossy())),
+                None => rel,
+            };
+            let dest = self.work.join(&rel);
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let size = e.unpacked_size;
+            a = h.extract_to(&dest).map_err(|e| format!("{raw}: {e}"))?;
+            n += 1;
+            bytes += size;
+        }
+        if n == 0 {
+            return Err("archive contains no files".into());
+        }
+        Ok((n, bytes))
     }
 
     // ---------- par2 repair ----------
@@ -995,6 +1253,7 @@ impl Job {
             return RepairOutcome::Repaired(format!("par2: all {total} slices verified"));
         }
         if set.recv.len() >= damaged.len() {
+            self.phase.store(PH_REPAIR, Relaxed);
             let t1 = Instant::now();
             if let Err(e) = Self::solve(plan, &files, &set, &map, &damaged, total) {
                 return RepairOutcome::Failed(e);
@@ -1053,12 +1312,14 @@ impl Job {
                     for s in 0..self.files[i].segs.len() {
                         work.push(Work { job: self.clone(), file: i as u32, seg: s as u32, tried: 0 });
                     }
+                    self.enc_total.fetch_add(self.files[i].segs.iter().map(|s| s.bytes as u64).sum(), Relaxed);
                 }
             }
         }
         self.stage.fetch_add(1, Relaxed);
+        self.phase.store(PH_PAR2, Relaxed);
         self.remaining.store(work.len() + 1, Relaxed);
-        QUEUE.get().expect("queue").push_front(work);
+        self.enqueue(QUEUE.get().expect("queue"), work, true);
         self.segment_done();
         RepairOutcome::Fetching
     }
@@ -1084,9 +1345,13 @@ impl Job {
 
     fn finalize(self: Arc<Self>) {
         let plan = self.plan.get().expect("plan");
+        self.phase.store(PH_VERIFY, Relaxed);
         self.drain_io(plan);
         let stage = self.stage.load(Relaxed);
         let mut notes = vec![];
+        if self.is_cancelled() {
+            return self.report(plan, false, vec!["cancelled".into()]);
+        }
         if self.is_aborted() {
             let msg = format!(
                 "hopeless: {:.1} MB missing (or first articles gone), only {:.1} MB of par2 recovery in NZB",
@@ -1120,6 +1385,12 @@ impl Job {
             }
         }
         let (mut parts, sets_ok) = self.verify_sets(plan, repaired);
+        if sets_ok {
+            parts.extend(self.extract_tail_files(plan));
+        }
+        if !plan.raw_rar.is_empty() {
+            self.phase.store(PH_EXTRACT, Relaxed);
+        }
         let (raw, raw_ok) = self.extract_raw(plan);
         parts.extend(raw);
         parts.extend(plan.main.iter().cloned());
@@ -1131,12 +1402,14 @@ impl Job {
         let ok = sets_ok && raw_ok && write_errors == 0;
         if ok {
             let _ = fs::remove_dir_all(self.work.join(".aux"));
-            if let Some(parent) = self.done_dir.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            let _ = fs::remove_dir_all(&self.done_dir);
-            if let Err(e) = fs::rename(&self.work, &self.done_dir) {
-                parts.push(format!("move failed: {e}"));
+            if let Some(done) = &self.done_dir {
+                if let Some(parent) = done.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::remove_dir_all(done);
+                if let Err(e) = fs::rename(&self.work, done) {
+                    parts.push(format!("move failed: {e}"));
+                }
             }
         }
         self.report(plan, ok, parts);
@@ -1147,7 +1420,8 @@ impl Job {
         if plan.notes.len() > 3 {
             parts.push(format!("(+{} more notes)", plan.notes.len() - 3));
         }
-        (self.finished)(self, JobResult { ok, summary: parts.join("; ") });
+        self.phase.store(PH_DONE, Relaxed);
+        (self.finished)(self, JobResult { ok, summary: parts.join("; "), parts });
     }
 }
 

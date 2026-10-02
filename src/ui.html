@@ -1,0 +1,676 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>nzbfast</title>
+<style>
+:root{
+  --bg:#0a0c0f;--panel:#11151a;--panel2:#161b21;--line:#222a33;--text:#dbe2ea;--dim:#7d8896;--faint:#4a5562;
+  --accent:#5ad1ff;--ok:#3ddc84;--warn:#ffb547;--bad:#ff5f5f;--violet:#b48cff;
+  --mono:ui-monospace,SFMono-Regular,"JetBrains Mono",Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+}
+@media (prefers-color-scheme:light){
+  :root{--bg:#f4f6f8;--panel:#ffffff;--panel2:#f7f9fb;--line:#e1e6ec;--text:#1b2430;--dim:#5e6b7a;--faint:#a3adb9;--accent:#0a84c6}
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);font:13px/1.4 var(--sans)}
+body{padding:0 16px 40px;max-width:1680px;margin:0 auto}
+.num,td.n,.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+header{display:flex;flex-wrap:wrap;align-items:center;gap:12px 20px;padding:14px 0 10px;position:sticky;top:0;background:var(--bg);z-index:5}
+.brand{font:700 15px var(--sans);letter-spacing:.02em;display:flex;align-items:center;gap:8px}
+.brand b{color:var(--accent)}
+.pill{display:inline-block;padding:2px 8px;border-radius:99px;font:600 11px var(--sans);letter-spacing:.03em;text-transform:uppercase;background:var(--panel2);border:1px solid var(--line);color:var(--dim);white-space:nowrap}
+.pill.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 40%,transparent)}
+.pill.warn{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 40%,transparent)}
+.pill.bad{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 40%,transparent)}
+.pill.acc{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 40%,transparent)}
+.pill.vio{color:var(--violet);border-color:color-mix(in srgb,var(--violet) 40%,transparent)}
+.spacer{flex:1}
+button,select,input{font:inherit;color:var(--text);background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:5px 10px}
+button{cursor:pointer}
+button:hover{border-color:var(--faint)}
+button.primary{background:var(--accent);color:#001018;border-color:transparent;font-weight:600}
+button.icon{padding:2px 7px;font-size:12px;line-height:18px;min-width:26px}
+button.danger:hover{color:var(--bad);border-color:var(--bad)}
+.hero{display:grid;grid-template-columns:minmax(230px,300px) 1fr;gap:14px;margin-top:4px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px}
+.speed{padding:16px 18px;display:flex;flex-direction:column;justify-content:center;gap:4px}
+.speed .big{font:600 52px/1 var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.speed .unit{font:500 16px var(--sans);color:var(--dim);margin-left:6px}
+.speed .sub{color:var(--dim);font-size:12px}
+.speed .sub span{color:var(--text)}
+.graphwrap{position:relative;padding:10px 12px 8px;min-width:0}
+.graphhead{display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap}
+.legend{display:flex;gap:12px;flex-wrap:wrap;color:var(--dim);font-size:12px}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}
+.seg button{border:0;border-radius:0;padding:3px 9px;background:transparent;color:var(--dim)}
+.seg button.on{background:var(--panel2);color:var(--text)}
+canvas#g{display:block;width:100%;height:190px}
+#tip{position:absolute;pointer-events:none;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:6px 8px;font:12px var(--mono);white-space:pre;display:none;z-index:3;box-shadow:0 6px 20px rgba(0,0,0,.35)}
+.cards{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:14px;margin-top:14px}
+.card{padding:12px 14px;min-width:0}
+.card h3,.sec h2{margin:0 0 6px;font:600 11px var(--sans);letter-spacing:.08em;text-transform:uppercase;color:var(--dim)}
+.card .v{font:600 22px var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.card .d{color:var(--dim);font-size:12px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.meter{height:6px;border-radius:9px;background:var(--panel2);overflow:hidden;margin-top:8px;position:relative}
+.meter i{position:absolute;inset:0;transform-origin:left;transform:scaleX(0);background:var(--accent);will-change:transform}
+.meter i.w{background:var(--warn)}
+.sec{margin-top:16px}
+.sec .head{display:flex;align-items:center;gap:10px;padding:12px 14px 8px;flex-wrap:wrap}
+.sec .head h2{margin:0}
+.sec .head .count{color:var(--dim);font-size:12px}
+.tw{overflow-x:auto}
+table{width:100%;border-collapse:collapse}
+th{font:600 11px var(--sans);letter-spacing:.05em;text-transform:uppercase;color:var(--dim);text-align:left;padding:6px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:6px 10px;border-bottom:1px solid color-mix(in srgb,var(--line) 60%,transparent);white-space:nowrap;vertical-align:middle}
+tr:last-child td{border-bottom:0}
+th.n,td.n{text-align:right}
+td.name{max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+td.msg{max-width:420px;overflow:hidden;text-overflow:ellipsis;color:var(--dim)}
+td.act{text-align:right}
+td.act button{margin-left:4px}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;vertical-align:-1px}
+.via{color:var(--dim);font-size:11px;margin-left:6px}
+.pbar{position:relative;width:180px;height:16px;border-radius:5px;background:var(--panel2);overflow:hidden;display:inline-block;vertical-align:middle}
+.pbar i{position:absolute;inset:0;transform-origin:left;transform:scaleX(0);background:color-mix(in srgb,var(--accent) 55%,transparent);will-change:transform}
+.pbar span{position:relative;font:11px/16px var(--mono);padding-left:6px;color:var(--text)}
+.rbar{position:relative;display:inline-block;width:90px;height:6px;border-radius:9px;background:var(--panel2);overflow:hidden;vertical-align:middle;margin-right:8px}
+.rbar i{position:absolute;inset:0;transform-origin:left;transform:scaleX(0);will-change:transform}
+.empty td{color:var(--dim);text-align:center;padding:18px}
+.pager{display:flex;gap:6px;align-items:center;color:var(--dim)}
+#conn{width:8px;height:8px;border-radius:50%;background:var(--bad);display:inline-block}
+#conn.on{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:20}
+.overlay[hidden]{display:none}
+.dialog{padding:20px;width:min(440px,92vw);display:flex;flex-direction:column;gap:10px}
+.dialog h2{margin:0 0 4px;font-size:16px}
+.dialog label{color:var(--dim);font-size:12px}
+.dialog .row{display:flex;gap:8px}
+.dialog .row>*{flex:1}
+.err{color:var(--bad);font-size:12px;min-height:16px}
+#dropzone{border:2px dashed var(--accent);border-radius:16px;padding:40px 60px;font-size:18px;background:var(--panel)}
+.toast{position:fixed;right:16px;bottom:16px;z-index:30;display:flex;flex-direction:column;gap:8px}
+.toast div{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;box-shadow:0 6px 20px rgba(0,0,0,.35)}
+@media (max-width:1100px){.cards{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media (max-width:760px){.hero{grid-template-columns:1fr}.cards{grid-template-columns:repeat(2,minmax(0,1fr))}.speed .big{font-size:40px}.pbar{width:110px}}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span id="conn" title="live stream"></span>nzb<b>fast</b></div>
+  <span id="state" class="pill">connecting</span>
+  <span class="spacer"></span>
+  <span class="mono" id="clock" style="color:var(--dim)"></span>
+  <select id="limit" title="Speed limit">
+    <option value="0">No limit</option>
+    <option value="1000M">1000 MB/s</option>
+    <option value="750M">750 MB/s</option>
+    <option value="500M">500 MB/s</option>
+    <option value="250M">250 MB/s</option>
+    <option value="100M">100 MB/s</option>
+    <option value="25M">25 MB/s</option>
+  </select>
+  <button id="pausebtn">Pause</button>
+  <button id="addbtn" class="primary">Add NZB</button>
+</header>
+
+<div class="hero">
+  <div class="panel speed">
+    <div><span class="big" id="spd">0.00</span><span class="unit" id="spdu">Gbit/s</span></div>
+    <div class="sub"><span id="spdB">0 MB/s</span> payload · NIC <span id="nic">0</span></div>
+    <div class="sub">1 s <span id="r1">0</span> · 5 s <span id="r5">0</span> · peak <span id="peak">0</span></div>
+  </div>
+  <div class="panel graphwrap">
+    <div class="graphhead">
+      <div class="legend" id="legend"></div>
+      <span class="spacer"></span>
+      <div class="seg" id="win">
+        <button data-w="300">30s</button><button data-w="1200" class="on">2m</button><button data-w="3000">5m</button>
+      </div>
+    </div>
+    <canvas id="g"></canvas>
+    <div id="tip"></div>
+  </div>
+</div>
+
+<div class="cards">
+  <div class="panel card"><h3>Queue</h3><div class="v" id="cq">–</div><div class="d" id="cq2">–</div></div>
+  <div class="panel card"><h3>Staging</h3><div class="v" id="cs">–</div><div class="d" id="cs2">–</div><div class="meter"><i id="csm"></i></div></div>
+  <div class="panel card"><h3>Mover → final</h3><div class="v" id="cm">–</div><div class="d" id="cm2">–</div></div>
+  <div class="panel card"><h3>Session</h3><div class="v" id="cx">–</div><div class="d" id="cx2">–</div></div>
+  <div class="panel card"><h3>Process</h3><div class="v" id="cp">–</div><div class="d" id="cp2">–</div></div>
+</div>
+
+<section class="panel sec">
+  <div class="head"><h2>Providers</h2><span class="count" id="srvc"></span></div>
+  <div class="tw"><table>
+    <thead><tr><th>Server</th><th>Throughput</th><th class="n">Conns</th><th class="n" title="Share of first attempts the server had">Hit</th><th class="n" title="Share of articles other servers lacked that this one had">Fill</th><th class="n">Articles</th><th class="n">Missing</th><th class="n">Errors</th><th class="n" title="Time between responses when an article is missing">430 gap</th><th class="n">Session</th><th>State</th></tr></thead>
+    <tbody id="srv"></tbody>
+  </table></div>
+</section>
+
+<section class="panel sec">
+  <div class="head"><h2>Downloading</h2><span class="count" id="actc"></span></div>
+  <div class="tw"><table>
+    <thead><tr><th>Name</th><th>Cat</th><th>Stage</th><th>Progress</th><th class="n">Size</th><th class="n">Speed</th><th class="n">Missing</th><th class="n">Time</th><th></th></tr></thead>
+    <tbody id="act"></tbody>
+  </table></div>
+</section>
+
+<section class="panel sec">
+  <div class="head"><h2>Queue</h2><span class="count" id="qc"></span><span class="spacer"></span>
+    <input id="qsearch" placeholder="Filter…" size="18">
+    <div class="pager"><button class="icon" id="qprev">‹</button><span id="qpage" class="mono"></span><button class="icon" id="qnext">›</button></div>
+  </div>
+  <div class="tw"><table>
+    <thead><tr><th class="n">#</th><th>Name</th><th>Cat</th><th>Priority</th><th class="n">Size</th><th class="n">Left</th><th>Status</th><th class="n">ETA</th><th class="n">Age</th><th></th></tr></thead>
+    <tbody id="q"></tbody>
+  </table></div>
+</section>
+
+<section class="panel sec">
+  <div class="head"><h2>History</h2><span class="count" id="hc"></span><span class="spacer"></span>
+    <input id="hsearch" placeholder="Filter…" size="18">
+    <select id="hfilter"><option value="">All</option><option value="failed">Failed only</option></select>
+    <button id="hclear" class="danger" title="Remove failed jobs from history">Clear failed</button>
+    <div class="pager"><button class="icon" id="hprev">‹</button><span id="hpage" class="mono"></span><button class="icon" id="hnext">›</button></div>
+  </div>
+  <div class="tw"><table>
+    <thead><tr><th>Status</th><th>Name</th><th>Cat</th><th class="n">Size</th><th class="n">Download</th><th class="n">Avg</th><th class="n">Post</th><th class="n">Finished</th><th>Details</th><th></th></tr></thead>
+    <tbody id="h"></tbody>
+  </table></div>
+</section>
+
+<div class="overlay" id="login" hidden>
+  <form class="panel dialog" id="loginf">
+    <h2>nzbfast</h2>
+    <label for="lk">API key</label>
+    <input id="lk" type="password" autocomplete="current-password" autofocus>
+    <div class="err" id="lerr"></div>
+    <button class="primary">Sign in</button>
+  </form>
+</div>
+
+<div class="overlay" id="adddlg" hidden>
+  <form class="panel dialog" id="addf">
+    <h2>Add NZB</h2>
+    <label>Files</label><input type="file" id="af" accept=".nzb,.gz" multiple>
+    <label>…or URL</label><input id="au" placeholder="https://…">
+    <div class="row">
+      <div><label>Category</label><select id="acat"></select></div>
+      <div><label>Priority</label><select id="apri"><option value="-100">Default</option><option value="2">Force</option><option value="1">High</option><option value="0">Normal</option><option value="-1">Low</option><option value="-2">Paused</option></select></div>
+    </div>
+    <div class="err" id="aerr"></div>
+    <div class="row"><button type="button" id="acancel">Cancel</button><button class="primary">Add</button></div>
+  </form>
+</div>
+<div class="overlay" id="drop" hidden><div id="dropzone">Drop NZB files to add them</div></div>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const HDR = {"X-Nzbfast-UI": "1"};
+const COLORS = ["#5ad1ff", "#3ddc84", "#ffb547", "#b48cff", "#ff7ab6", "#7cf5e6", "#f7e463", "#ff8f5c"];
+const N = 3000;                       // samples kept (5 min at 10 Hz)
+let INIT = null, S = null, dirty = false, win = 1200;
+const ring = {rx: new Float32Array(N), nic: new Float32Array(N), srv: [], len: 0, head: 0};
+let lastK = -1, peak = 0;
+
+// ---------- formatting ----------
+function bits(Bps) { // bytes/s -> [value, unit]
+  const b = Bps * 8;
+  if (b >= 1e9) return [(b / 1e9).toFixed(2), "Gbit/s"];
+  if (b >= 1e6) return [(b / 1e6).toFixed(b >= 1e8 ? 0 : 1), "Mbit/s"];
+  return [(b / 1e3).toFixed(0), "kbit/s"];
+}
+const fbits = v => bits(v).join(" ");
+function axis(Bps) { // compact bit-rate label for the graph axis
+  const b = Bps * 8;
+  if (b >= 1e9) return +(b / 1e9).toFixed(2) + "G";
+  if (b >= 1e6) return +(b / 1e6).toFixed(1) + "M";
+  return b ? +(b / 1e3).toFixed(0) + "k" : "0";
+}
+function fbytes(b) {
+  if (!(b > 0)) return "0 B";
+  const u = ["B", "KB", "MB", "GB", "TB", "PB"]; let i = 0;
+  while (b >= 1000 && i < u.length - 1) { b /= 1000; i++; }
+  return (i === 0 ? b.toFixed(0) : b.toFixed(b >= 100 ? 0 : b >= 10 ? 1 : 2)) + " " + u[i];
+}
+const frate = v => fbytes(v) + "/s";
+function fdur(s) {
+  s = Math.max(0, Math.round(s));
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m " + String(s % 60).padStart(2, "0") + "s";
+  if (s < 86400) return Math.floor(s / 3600) + "h " + String(Math.floor(s / 60) % 60).padStart(2, "0") + "m";
+  return Math.floor(s / 86400) + "d " + Math.floor(s / 3600) % 24 + "h";
+}
+function ago(t) { return fdur(Date.now() / 1000 - t) + " ago"; }
+const PRIO = {"2": "Force", "1": "High", "0": "Normal", "-1": "Low"};
+
+// DOM writes only when a value changes.
+function txt(el, v) { if (el._t !== v) { el._t = v; el.textContent = v; } }
+function cls(el, v) { if (el._c !== v) { el._c = v; el.className = v; } }
+function scale(el, f) { f = Math.max(0, Math.min(1, f || 0)); if (el._s === undefined || Math.abs(el._s - f) > 0.0015) { el._s = f; el.style.transform = "scaleX(" + f + ")"; } }
+function el(tag, cl, text) { const e = document.createElement(tag); if (cl) e.className = cl; if (text !== undefined) e.textContent = text; return e; }
+
+// Keyed rows: reuses <tr>s, moves them only when the order changes.
+function sync(tbody, items, key, make, update, emptyText, cols) {
+  const map = tbody._m || (tbody._m = new Map());
+  if (!items.length) {
+    for (const tr of map.values()) tr.remove(); map.clear();
+    if (!tbody._empty) { const tr = el("tr", "empty"); const td = el("td", "", emptyText); td.colSpan = cols; tr.appendChild(td); tbody._empty = tr; }
+    if (!tbody._empty.parentNode) tbody.appendChild(tbody._empty);
+    return;
+  }
+  if (tbody._empty && tbody._empty.parentNode) tbody._empty.remove();
+  const seen = new Set(); let prev = null;
+  for (const it of items) {
+    const k = key(it); seen.add(k);
+    let tr = map.get(k);
+    if (!tr) { tr = make(it); tr._k = k; map.set(k, tr); }
+    update(tr, it);
+    const want = prev ? prev.nextSibling : tbody.firstChild;
+    if (want !== tr) tbody.insertBefore(tr, want);
+    prev = tr;
+  }
+  for (const [k, tr] of map) if (!seen.has(k)) { tr.remove(); map.delete(k); }
+}
+function row(cells) { // cells: [[name, class], ...] -> tr with tr.c[name]
+  const tr = el("tr"); tr.c = {};
+  for (const [n, c] of cells) { const td = el("td", c || ""); tr.c[n] = td; tr.appendChild(td); }
+  return tr;
+}
+function toast(msg) {
+  const d = el("div", "", msg); $("#toast").appendChild(d);
+  setTimeout(() => d.remove(), 4000);
+}
+
+// ---------- API ----------
+async function api(params, body) {
+  const qs = new URLSearchParams(Object.assign({output: "json"}, params));
+  const r = await fetch("/api?" + qs, body ? {method: "POST", headers: HDR, body} : {headers: HDR});
+  if (r.status === 401) { showLogin(); throw new Error("unauthorized"); }
+  const j = await r.json();
+  if (j && j.status === false && j.error) throw new Error(j.error);
+  return j;
+}
+const act = (params) => api(params).then(() => { qDirty = hDirty = true; }).catch(e => toast(e.message));
+
+// ---------- live stream ----------
+let es = null;
+function connect() {
+  if (es) es.close();
+  es = new EventSource("/events");
+  es.addEventListener("init", e => { INIT = JSON.parse(e.data); setupServers(); loadRing(INIT.ring); qDirty = hDirty = true; });
+  es.onmessage = e => {
+    S = JSON.parse(e.data);
+    let steps = lastK < 0 ? 1 : Math.min(50, Math.max(1, S.k - lastK));
+    lastK = S.k;
+    while (steps--) push(S.rx, S.nic, S.srv.map(s => s[0]));
+    dirty = true;
+  };
+  es.onopen = () => cls($("#conn"), "on");
+  es.onerror = () => { cls($("#conn"), ""); fetch("/ui/session").then(r => r.json()).then(j => { if (!j.auth) { es.close(); showLogin(); } }).catch(() => {}); };
+}
+function push(rx, nic, srv) {
+  const h = ring.head;
+  ring.rx[h] = rx; ring.nic[h] = nic;
+  for (let i = 0; i < ring.srv.length; i++) ring.srv[i][h] = srv[i] || 0;
+  ring.head = (h + 1) % N; ring.len = Math.min(N, ring.len + 1);
+  if (rx > peak) peak = rx;
+}
+function loadRing(r) {
+  ring.len = 0; ring.head = 0; peak = 0; lastK = -1;
+  ring.srv = INIT.servers.map(() => new Float32Array(N));
+  for (let i = 0; i < r.rx.length; i++) push(r.rx[i], r.nic[i], r.srv.map(a => a[i]));
+}
+function setupServers() {
+  const lg = $("#legend"); lg.textContent = "";
+  INIT.servers.forEach((s, i) => { const sp = el("span"); const d = el("i"); d.style.background = COLORS[i % COLORS.length]; sp.append(d, s.name); lg.appendChild(sp); });
+  const sp = el("span"); const d = el("i"); d.style.background = "transparent"; d.style.border = "1px solid var(--text)"; sp.append(d, "NIC"); lg.appendChild(sp);
+  $("#srv")._m = null; $("#srv").textContent = "";
+}
+
+// ---------- graph ----------
+const cv = $("#g"), cx = cv.getContext("2d");
+let gw = 0, gh = 0, dpr = 1, yMax = 1.25e8, hoverX = -1;
+const cols = {stack: [], nic: null, n: 0};
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  const r = cv.getBoundingClientRect();
+  gw = Math.max(50, Math.floor(r.width)); gh = Math.floor(r.height);
+  cv.width = gw * dpr; cv.height = gh * dpr; dirty = true;
+}
+new ResizeObserver(resize).observe(cv);
+function niceStep(maxBits) {
+  const raw = maxBits / 4, p = Math.pow(10, Math.floor(Math.log10(raw)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= raw) return m * p;
+  return 10 * p;
+}
+let theme = null;
+matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => { theme = null; dirty = true; });
+function drawGraph() {
+  if (!gw) return;
+  if (!theme) { const css = getComputedStyle(document.documentElement); theme = {line: css.getPropertyValue("--line").trim(), dim: css.getPropertyValue("--dim").trim(), text: css.getPropertyValue("--text").trim(), mono: css.getPropertyValue("--mono")}; }
+  const cLine = theme.line, cDim = theme.dim, cText = theme.text;
+  cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  cx.clearRect(0, 0, gw, gh);
+  const L = 44, R = 6, T = 6, B = 16, pw = gw - L - R, ph = gh - T - B;
+  const ns = ring.srv.length, n = Math.min(win, ring.len), off = win - n;
+  const C = Math.max(1, Math.floor(pw));
+  // Average samples into pixel columns.
+  if (cols.n !== C || cols.stack.length !== ns) { cols.stack = Array.from({length: ns}, () => new Float32Array(C)); cols.nic = new Float32Array(C); cols.cnt = new Float32Array(C); cols.n = C; }
+  for (const a of cols.stack) a.fill(0); cols.nic.fill(0); cols.cnt.fill(0);
+  const start = (ring.head - n + N) % N;
+  for (let i = 0; i < n; i++) {
+    const j = (start + i) % N, c = Math.min(C - 1, Math.floor((off + i) * C / win));
+    for (let s = 0; s < ns; s++) cols.stack[s][c] += ring.srv[s][j];
+    cols.nic[c] += ring.nic[j]; cols.cnt[c]++;
+  }
+  let target = 0;
+  for (let c = 0; c < C; c++) {
+    const k = cols.cnt[c]; if (!k) continue;
+    let acc = 0;
+    for (let s = 0; s < ns; s++) { acc += cols.stack[s][c] / k; cols.stack[s][c] = acc; }
+    cols.nic[c] /= k;
+    target = Math.max(target, acc, cols.nic[c]);
+  }
+  target = Math.max(target * 1.12, 1.25e6);
+  yMax = target > yMax ? target : yMax + (target - yMax) * 0.08;
+  const y = v => T + ph - (v / yMax) * ph;
+  // Grid + labels (bits).
+  const step = niceStep(yMax * 8) / 8;
+  cx.font = "11px " + theme.mono; cx.textAlign = "right"; cx.textBaseline = "middle";
+  for (let v = 0; v <= yMax; v += step) {
+    const yy = Math.round(y(v)) + 0.5;
+    cx.strokeStyle = cLine; cx.lineWidth = 1; cx.beginPath(); cx.moveTo(L, yy); cx.lineTo(L + pw, yy); cx.stroke();
+    cx.fillStyle = cDim; cx.fillText(axis(v), L - 6, yy);
+  }
+  // Line-rate reference.
+  if (INIT && INIT.line && INIT.line < yMax) {
+    const yy = Math.round(y(INIT.line)) + 0.5;
+    cx.setLineDash([4, 4]); cx.strokeStyle = "#ff5f5f99"; cx.beginPath(); cx.moveTo(L, yy); cx.lineTo(L + pw, yy); cx.stroke(); cx.setLineDash([]);
+    cx.textAlign = "left"; cx.fillStyle = "#ff5f5fcc"; cx.fillText("line " + fbits(INIT.line), L + 4, yy - 8); cx.textAlign = "right";
+  }
+  // Stacked areas, top layer first.
+  const first = Math.min(C - 1, Math.floor(off * C / win));
+  for (let s = ns - 1; s >= 0; s--) {
+    const a = cols.stack[s], below = s > 0 ? cols.stack[s - 1] : null;
+    cx.beginPath();
+    cx.moveTo(L + first, y(a[first]));
+    for (let c = first + 1; c < C; c++) cx.lineTo(L + c, y(a[c]));
+    for (let c = C - 1; c >= first; c--) cx.lineTo(L + c, y(below ? below[c] : 0));
+    cx.closePath();
+    const col = COLORS[s % COLORS.length];
+    cx.fillStyle = col + "55"; cx.fill();
+    cx.beginPath(); cx.moveTo(L + first, y(a[first]));
+    for (let c = first + 1; c < C; c++) cx.lineTo(L + c, y(a[c]));
+    cx.strokeStyle = col; cx.lineWidth = 1.2; cx.stroke();
+  }
+  // NIC line.
+  cx.beginPath(); cx.moveTo(L + first, y(cols.nic[first]));
+  for (let c = first + 1; c < C; c++) cx.lineTo(L + c, y(cols.nic[c]));
+  cx.strokeStyle = cText; cx.globalAlpha = 0.65; cx.lineWidth = 1; cx.stroke(); cx.globalAlpha = 1;
+  // Time axis.
+  cx.textAlign = "center"; cx.textBaseline = "alphabetic"; cx.fillStyle = cDim;
+  const secs = win / 10, tick = secs <= 30 ? 5 : secs <= 120 ? 20 : 60;
+  for (let t = 0; t <= secs; t += tick) { const x = L + pw - t / secs * pw; cx.fillText(t ? "-" + t + "s" : "now", Math.min(Math.max(x, L + 12), L + pw - 12), gh - 3); }
+  // Hover.
+  const tip = $("#tip");
+  if (hoverX >= L && hoverX < L + pw && ring.len) {
+    const c = Math.floor(hoverX - L);
+    cx.strokeStyle = cText; cx.globalAlpha = .35; cx.beginPath(); cx.moveTo(L + c + .5, T); cx.lineTo(L + c + .5, T + ph); cx.stroke(); cx.globalAlpha = 1;
+    if (cols.cnt[c]) {
+      const tsec = ((C - c) / C * secs).toFixed(1);
+      let s = "-" + tsec + "s\ntotal " + fbits(cols.stack[ns - 1][c]).padStart(13) + "\nNIC   " + fbits(cols.nic[c]).padStart(13);
+      for (let i = 0; i < ns; i++) s += "\n" + INIT.servers[i].name.slice(0, 12).padEnd(12) + " " + fbits(cols.stack[i][c] - (i ? cols.stack[i - 1][c] : 0)).padStart(12);
+      tip.textContent = s; tip.style.display = "block";
+      const x = hoverX + 16 + 220 > gw ? hoverX - 230 : hoverX + 16; tip.style.left = x + "px"; tip.style.top = "40px";
+    }
+  } else tip.style.display = "none";
+}
+cv.addEventListener("mousemove", e => { hoverX = e.offsetX; dirty = true; });
+cv.addEventListener("mouseleave", () => { hoverX = -1; dirty = true; });
+$("#win").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  win = +b.dataset.w; for (const x of $("#win").children) x.classList.toggle("on", x === b); dirty = true;
+});
+
+// ---------- live panels ----------
+function render() {
+  if (!S) return;
+  const [v, u] = bits(S.rx);
+  txt($("#spd"), v); txt($("#spdu"), u);
+  txt($("#spdB"), frate(S.rx)); txt($("#nic"), fbits(S.nic));
+  txt($("#r1"), fbits(S.r1)); txt($("#r5"), fbits(S.r5)); txt($("#peak"), fbits(peak));
+  const nq = S.q[0], nact = S.q[1];
+  const state = S.p ? ["paused", "pill warn"] : nact ? ["downloading", "pill ok"] : nq ? ["waiting", "pill acc"] : ["idle", "pill"];
+  txt($("#state"), state[0]); cls($("#state"), state[1]);
+  txt($("#pausebtn"), S.p ? "Resume" : "Pause");
+  const lim = $("#limit");
+  if (document.activeElement !== lim) {
+    const want = S.lim ? String(Math.round(S.lim / 1048576)) + "M" : "0";
+    if (![...lim.options].some(o => o.value === want)) { const o = el("option", "", Math.round(S.lim / 1048576) + " MB/s"); o.value = want; lim.appendChild(o); }
+    if (lim.value !== want) lim.value = want;
+  }
+  // Cards.
+  txt($("#cq"), nq + " job" + (nq === 1 ? "" : "s"));
+  txt($("#cq2"), fbytes(S.q[2]) + " left · ETA " + (S.q[3] ? fdur(S.q[3]) : "–") + " · " + nact + " active");
+  const [res, lim2, free] = S.st;
+  txt($("#cs"), fbytes(res)); txt($("#cs2"), "of " + fbytes(lim2) + " budget · " + fbytes(free) + " free");
+  const sm = $("#csm"); scale(sm, res / Math.max(1, lim2)); cls(sm, res > lim2 * 0.9 ? "w" : "");
+  txt($("#cm"), frate(S.mv[1])); txt($("#cm2"), S.mv[0] + " moving · " + fbytes(S.mv[2]) + " waiting");
+  txt($("#cx"), fbytes(S.s[0])); txt($("#cx2"), S.s[1] + " done · " + S.s[2] + " failed · up " + fdur(S.s[3]));
+  txt($("#cp"), S.sys[0].toFixed(0) + "% CPU"); txt($("#cp2"), fbytes(S.sys[1]) + " RSS · " + fbytes(S.sys[2]) + " buffers · " + S.sys[3] + " cores");
+  renderServers(); renderActive();
+  txt($("#clock"), new Date(S.t).toLocaleTimeString());
+}
+
+function renderServers() {
+  if (!INIT) return;
+  const items = S.srv.map((s, i) => ({i, s}));
+  const maxR = Math.max(1, ...S.srv.map(s => s[0]));
+  let up = 0;
+  sync($("#srv"), items, it => it.i, it => {
+    const tr = row([["name"], ["rate"], ["conn", "n"], ["hit", "n"], ["fill", "n"], ["ok", "n"], ["miss", "n"], ["err", "n"], ["gap", "n"], ["tot", "n"], ["st"]]);
+    const sv = INIT.servers[it.i];
+    const d = el("span", "dot"); d.style.background = COLORS[it.i % COLORS.length];
+    tr.c.name.append(d, sv.name);
+    tr.c.name.appendChild(el("span", "via", sv.via ? "via " + sv.via : sv.host));
+    if (sv.prio) tr.c.name.appendChild(el("span", "via", "backup " + sv.prio));
+    const rb = el("span", "rbar"); const ri = el("i"); ri.style.background = COLORS[it.i % COLORS.length]; rb.appendChild(ri);
+    tr.ri = ri; tr.rt = el("span", "mono"); tr.c.rate.append(rb, tr.rt);
+    tr.pill = el("span", "pill"); tr.c.st.appendChild(tr.pill);
+    return tr;
+  }, (tr, it) => {
+    const s = it.s, sv = INIT.servers[it.i];
+    scale(tr.ri, s[0] / maxR); txt(tr.rt, fbits(s[0]));
+    txt(tr.c.conn, s[1] + "/" + sv.conns);
+    txt(tr.c.hit, s[3].toFixed(1) + "%"); txt(tr.c.fill, s[4].toFixed(1) + "%");
+    txt(tr.c.ok, s[5].toLocaleString()); txt(tr.c.miss, s[6].toLocaleString()); txt(tr.c.err, (s[7] + s[11]).toLocaleString());
+    txt(tr.c.gap, s[8] ? s[8].toFixed(0) + " ms" : "–"); txt(tr.c.tot, fbytes(s[10]));
+    const st = s[9] ? ["down", "pill bad"] : s[1] ? ["active", "pill ok"] : ["idle", "pill"];
+    if (!s[9]) up++;
+    txt(tr.pill, st[0]); cls(tr.pill, st[1]);
+  }, "", 11);
+  txt($("#srvc"), up + " of " + S.srv.length + " up · " + S.srv.reduce((a, s) => a + s[1], 0) + " connections");
+}
+
+const PHASE = {probing: "acc", downloading: "ok", verifying: "vio", repairing: "warn", "fetching par2": "warn", extracting: "vio", finishing: "vio", paused: ""};
+function renderActive() {
+  const jobs = S.jobs;
+  txt($("#actc"), S.q[1] + " active" + (S.q[1] > jobs.length ? " (showing " + jobs.length + ")" : "") + " · " + S.q[5].toLocaleString() + " articles queued");
+  sync($("#act"), jobs, j => j[0], j => {
+    const tr = row([["name", "name"], ["cat"], ["ph"], ["pr"], ["size", "n"], ["spd", "n"], ["miss", "n"], ["time", "n"], ["act", "act"]]);
+    tr.ph = el("span", "pill"); tr.c.ph.appendChild(tr.ph);
+    const pb = el("span", "pbar"); tr.pi = el("i"); tr.pt = el("span"); pb.append(tr.pi, tr.pt); tr.c.pr.appendChild(pb);
+    tr.pb = el("button", "icon"); tr.pb.dataset.a = "pause";
+    const del = el("button", "icon danger", "✕"); del.dataset.a = "del"; del.title = "Delete";
+    tr.c.act.append(tr.pb, del);
+    return tr;
+  }, (tr, j) => {
+    const [id, name, cat, ph, tot, done, rate, miss, prio, el2] = j;
+    txt(tr.c.name, name); tr.c.name.title = name; txt(tr.c.cat, cat);
+    txt(tr.ph, ph); cls(tr.ph, "pill " + (PHASE[ph] || ""));
+    const f = tot ? done / tot : 0; scale(tr.pi, f); txt(tr.pt, (f * 100).toFixed(1) + "%");
+    txt(tr.c.size, fbytes(done) + " / " + fbytes(tot)); txt(tr.c.spd, rate > 0 ? fbits(rate) : "–");
+    txt(tr.c.miss, miss ? miss.toLocaleString() : "–"); txt(tr.c.time, fdur(el2));
+    const paused = ph === "paused";
+    txt(tr.pb, paused ? "▶" : "❚❚"); tr.pb.title = paused ? "Resume" : "Pause"; tr.pb.dataset.a = paused ? "resume" : "pause";
+  }, "Nothing downloading", 9);
+}
+$("#act").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return; const id = b.closest("tr")._k;
+  if (b.dataset.a === "del") { if (confirm("Delete this job and its data?")) act({mode: "queue", name: "delete", value: id, del_files: 1}); }
+  else act({mode: "queue", name: b.dataset.a, value: id});
+});
+
+// ---------- queue & history (fetched when they change) ----------
+let qDirty = true, hDirty = true, qBusy = false, hBusy = false, qv = -1, hv = -1, qStart = 0, hStart = 0, cats = [];
+const PAGE = 50;
+let lastQ = 0, lastH = 0;
+async function loadQueue() {
+  qBusy = true; qDirty = false; lastQ = performance.now();
+  try {
+    const p = {mode: "queue", start: qStart, limit: PAGE};
+    const s = $("#qsearch").value.trim(); if (s) p.search = s;
+    const j = (await api(p)).queue;
+    txt($("#qc"), j.noofslots_total + " jobs · " + j.sizeleft + " left · " + (j.timeleft !== "0:00:00" ? "ETA " + j.timeleft : "no ETA"));
+    const pages = Math.max(1, Math.ceil(j.noofslots / PAGE)); txt($("#qpage"), (Math.floor(qStart / PAGE) + 1) + "/" + pages);
+    sync($("#q"), j.slots, s => s.nzo_id, s => {
+      const tr = row([["i", "n"], ["name", "name"], ["cat"], ["pri"], ["size", "n"], ["left", "n"], ["st"], ["eta", "n"], ["age", "n"], ["act", "act"]]);
+      const sel = el("select"); for (const v of ["2", "1", "0", "-1"]) { const o = el("option", "", PRIO[v]); o.value = v; sel.appendChild(o); }
+      sel.dataset.a = "prio"; tr.c.pri.appendChild(sel); tr.sel = sel;
+      tr.st = el("span", "pill"); tr.c.st.appendChild(tr.st);
+      const top = el("button", "icon", "⤒"); top.dataset.a = "top"; top.title = "Move to top";
+      tr.pb = el("button", "icon"); const del = el("button", "icon danger", "✕"); del.dataset.a = "del"; del.title = "Delete";
+      tr.c.act.append(top, tr.pb, del);
+      return tr;
+    }, (tr, s) => {
+      txt(tr.c.i, String(s.index + 1)); txt(tr.c.name, s.filename); tr.c.name.title = s.filename; txt(tr.c.cat, s.cat);
+      const pv = {Force: "2", High: "1", Normal: "0", Low: "-1"}[s.priority] || "0"; if (tr.sel.value !== pv && document.activeElement !== tr.sel) tr.sel.value = pv;
+      txt(tr.c.size, s.size); txt(tr.c.left, s.sizeleft);
+      const st = s.status, c = st === "Downloading" || st === "Fetching" ? "pill ok" : st === "Paused" ? "pill warn" : "pill";
+      txt(tr.st, st === "Downloading" ? s.nzbfast_phase || st : st); cls(tr.st, c);
+      txt(tr.c.eta, s.timeleft !== "0:00:00" ? s.timeleft : "–"); txt(tr.c.age, s.avg_age);
+      const paused = st === "Paused"; txt(tr.pb, paused ? "▶" : "❚❚"); tr.pb.dataset.a = paused ? "resume" : "pause"; tr.pb.title = paused ? "Resume" : "Pause";
+    }, "Queue is empty", 10);
+  } catch (e) { qDirty = true; }
+  qBusy = false;
+}
+$("#q").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return; const id = b.closest("tr")._k;
+  if (b.dataset.a === "del") act({mode: "queue", name: "delete", value: id, del_files: 1});
+  else if (b.dataset.a === "top") act({mode: "switch", value: id, value2: 0});
+  else act({mode: "queue", name: b.dataset.a, value: id});
+});
+$("#q").addEventListener("change", e => {
+  if (e.target.dataset.a === "prio") act({mode: "queue", name: "priority", value: e.target.closest("tr")._k, value2: e.target.value});
+});
+$("#qprev").onclick = () => { qStart = Math.max(0, qStart - PAGE); qDirty = true; };
+$("#qnext").onclick = () => { qStart += PAGE; qDirty = true; };
+$("#qsearch").oninput = () => { qStart = 0; qDirty = true; };
+
+async function loadHistory() {
+  hBusy = true; hDirty = false; lastH = performance.now();
+  try {
+    const p = {mode: "history", start: hStart, limit: PAGE};
+    const s = $("#hsearch").value.trim(); if (s) p.search = s;
+    if ($("#hfilter").value === "failed") p.failed_only = 1;
+    const j = (await api(p)).history;
+    txt($("#hc"), j.noofslots_total + " jobs · today " + j.day_size + " · week " + j.week_size + " · total " + j.total_size);
+    const pages = Math.max(1, Math.ceil(j.noofslots / PAGE)); txt($("#hpage"), (Math.floor(hStart / PAGE) + 1) + "/" + pages);
+    sync($("#h"), j.slots, s => s.nzo_id, s => {
+      const tr = row([["st"], ["name", "name"], ["cat"], ["size", "n"], ["dl", "n"], ["avg", "n"], ["pp", "n"], ["fin", "n"], ["msg", "msg"], ["act", "act"]]);
+      tr.st = el("span", "pill"); tr.c.st.appendChild(tr.st);
+      tr.rb = el("button", "icon", "↻"); tr.rb.dataset.a = "retry"; tr.rb.title = "Retry";
+      const del = el("button", "icon danger", "✕"); del.dataset.a = "del"; del.title = "Remove from history";
+      tr.c.act.append(tr.rb, del);
+      return tr;
+    }, (tr, s) => {
+      txt(tr.st, s.status); cls(tr.st, "pill " + (s.status === "Completed" ? "ok" : s.status === "Failed" ? "bad" : "vio"));
+      txt(tr.c.name, s.name); tr.c.name.title = s.storage || s.name; txt(tr.c.cat, s.category);
+      txt(tr.c.size, s.size); txt(tr.c.dl, fdur(s.download_time));
+      txt(tr.c.avg, s.download_time > 0 ? fbits(s.downloaded / s.download_time) : "–");
+      txt(tr.c.pp, s.status === "Moving" ? "…" : fdur(s.postproc_time)); txt(tr.c.fin, ago(s.completed));
+      const acts = (s.stage_log[0] || {}).actions || [];
+      const m = s.fail_message || acts.join(" · "); txt(tr.c.msg, m); tr.c.msg.title = acts.join("\n");
+      tr.rb.style.visibility = s.status === "Failed" ? "visible" : "hidden";
+    }, "No history yet", 10);
+  } catch (e) { hDirty = true; }
+  hBusy = false;
+}
+$("#h").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return; const id = b.closest("tr")._k;
+  if (b.dataset.a === "retry") act({mode: "retry", value: id});
+  else act({mode: "history", name: "delete", value: id, del_files: 0});
+});
+$("#hprev").onclick = () => { hStart = Math.max(0, hStart - PAGE); hDirty = true; };
+$("#hnext").onclick = () => { hStart += PAGE; hDirty = true; };
+$("#hsearch").oninput = () => { hStart = 0; hDirty = true; };
+$("#hfilter").onchange = () => { hStart = 0; hDirty = true; };
+$("#hclear").onclick = () => { if (confirm("Remove all failed jobs from history?")) act({mode: "history", name: "delete", value: "failed", del_files: 0}); };
+
+// ---------- controls ----------
+$("#pausebtn").onclick = () => act({mode: S && S.p ? "resume" : "pause"});
+$("#limit").onchange = e => act({mode: "config", name: "speedlimit", value: e.target.value});
+function openAdd() {
+  $("#aerr").textContent = ""; $("#adddlg").hidden = false;
+  api({mode: "get_cats"}).then(j => { const s = $("#acat"); s.textContent = ""; for (const c of j.categories) { const o = el("option", "", c === "*" ? "Default" : c); o.value = c; s.appendChild(o); } }).catch(() => {});
+}
+$("#addbtn").onclick = openAdd;
+$("#acancel").onclick = () => { $("#adddlg").hidden = true; };
+async function upload(files, cat, prio) {
+  let n = 0;
+  for (const f of files) {
+    const fd = new FormData(); fd.append("name", f, f.name);
+    try { await api({mode: "addfile", cat: cat || "*", priority: prio || "-100"}, fd); n++; } catch (e) { toast(f.name + ": " + e.message); }
+  }
+  if (n) toast("Added " + n + " NZB" + (n > 1 ? "s" : ""));
+  qDirty = true;
+}
+$("#addf").onsubmit = async e => {
+  e.preventDefault();
+  const files = $("#af").files, url = $("#au").value.trim(), cat = $("#acat").value, prio = $("#apri").value;
+  if (!files.length && !url) { $("#aerr").textContent = "Choose a file or enter a URL"; return; }
+  if (files.length) await upload(files, cat, prio);
+  if (url) { try { await api({mode: "addurl", name: url, cat, priority: prio}); toast("Added URL"); } catch (er) { $("#aerr").textContent = er.message; return; } }
+  $("#af").value = ""; $("#au").value = ""; $("#adddlg").hidden = true;
+};
+let dragN = 0;
+addEventListener("dragenter", e => { if ([...e.dataTransfer.types].includes("Files")) { dragN++; $("#drop").hidden = false; } });
+addEventListener("dragleave", () => { if (--dragN <= 0) { dragN = 0; $("#drop").hidden = true; } });
+addEventListener("dragover", e => e.preventDefault());
+addEventListener("drop", e => { e.preventDefault(); dragN = 0; $("#drop").hidden = true; const f = [...e.dataTransfer.files].filter(f => /\.nzb(\.gz)?$/i.test(f.name)); if (f.length) upload(f); });
+
+// ---------- auth ----------
+function showLogin() { $("#login").hidden = false; setTimeout(() => $("#lk").focus(), 0); }
+$("#loginf").onsubmit = async e => {
+  e.preventDefault();
+  const r = await fetch("/ui/login", {method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"}, body: "apikey=" + encodeURIComponent($("#lk").value)});
+  if (r.ok) { $("#login").hidden = true; $("#lk").value = ""; connect(); } else $("#lerr").textContent = "Wrong API key";
+};
+
+// ---------- main loop ----------
+function frame(now) {
+  if (dirty) { dirty = false; render(); drawGraph(); }
+  if (S) {
+    if (S.qv !== qv) { qv = S.qv; qDirty = true; }
+    if (S.hv !== hv) { hv = S.hv; hDirty = true; }
+  }
+  // Lists refresh on change, at most twice a second (active jobs move every tick anyway).
+  if (S && S.q[1] && now - lastQ > 2000) qDirty = true;
+  if (qDirty && !qBusy && now - lastQ > 500) loadQueue();
+  if (hDirty && !hBusy && now - lastH > 1000) loadHistory();
+  requestAnimationFrame(frame);
+}
+fetch("/ui/session").then(r => r.json()).then(j => { if (j.auth) connect(); else showLogin(); });
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

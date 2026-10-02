@@ -10,8 +10,8 @@ use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 #[derive(Default)]
 pub struct SStats {
@@ -21,6 +21,47 @@ pub struct SStats {
     pub errors: AtomicU64,
     pub live: AtomicU64,
     pub crc_errors: AtomicU64,
+    /// Connection attempts that failed in a row (reset by any successful login).
+    pub consec_fail: AtomicU64,
+    pub last_error: std::sync::Mutex<String>,
+}
+
+/// Global download speed limit (GCRA over received bytes; 0 = unlimited).
+pub struct Limiter {
+    pub rate: AtomicU64,
+    tat: AtomicU64,
+}
+
+pub static LIMIT: Limiter = Limiter { rate: AtomicU64::new(0), tat: AtomicU64::new(0) };
+
+fn mono_ns() -> u64 {
+    static T0: OnceLock<Instant> = OnceLock::new();
+    T0.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+
+impl Limiter {
+    /// Accounts for `n` received bytes, sleeping when the connection runs ahead of the limit.
+    /// Not reading makes TCP flow control slow the sender down.
+    pub fn consume(&self, n: u64) {
+        let rate = self.rate.load(Relaxed);
+        if rate == 0 {
+            return;
+        }
+        let now = mono_ns();
+        let cost = n.saturating_mul(1_000_000_000) / rate;
+        let mut tat = self.tat.load(Relaxed);
+        let new = loop {
+            let new = tat.max(now) + cost;
+            match self.tat.compare_exchange_weak(tat, new, Relaxed, Relaxed) {
+                Ok(_) => break new,
+                Err(t) => tat = t,
+            }
+        };
+        const BURST_NS: u64 = 50_000_000;
+        if new > now + BURST_NS {
+            std::thread::sleep(Duration::from_nanos(new - now - BURST_NS));
+        }
+    }
 }
 
 pub trait Stream: Read + Write + Send {}
@@ -114,10 +155,11 @@ impl Write for BigSock {
 }
 
 fn connect(cfg: &ServerCfg, tls: &Arc<rustls::ClientConfig>) -> io::Result<Box<dyn Stream>> {
-    let addr = (cfg.host.as_str(), cfg.port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no address"))?;
+    let addrs: Vec<_> = match &cfg.connect {
+        Some(c) => c.to_socket_addrs()?.collect(),
+        None => (cfg.host.as_str(), cfg.port).to_socket_addrs()?.collect(),
+    };
+    let addr = *addrs.first().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no address"))?;
     let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(15))?;
     tcp.set_nodelay(true)?;
     tcp.set_read_timeout(Some(Duration::from_secs(90)))?;
@@ -246,9 +288,46 @@ fn pop_live(ctx: &ConnCtx, wait: Option<Duration>) -> Option<Work> {
     }
 }
 
+/// Connection failures in a row (with no live connection) before a server is marked down.
+const DOWN_AFTER: u64 = 3;
+
+fn note_error(ctx: &ConnCtx, e: &io::Error) {
+    let n = ctx.st.errors.fetch_add(1, Relaxed);
+    if n < 5 || n % 100 == 0 {
+        eprintln!("[{}] {e}", ctx.cfg.name);
+    }
+    *ctx.st.last_error.lock().unwrap() = e.to_string();
+}
+
+/// Connects and logs in without any work, to find out whether a down server is back.
+fn probe(ctx: &ConnCtx) -> io::Result<()> {
+    let s = connect(&ctx.cfg, &ctx.tls)?;
+    let mut rd = Rd { s, buf: vec![0; 64 << 10], start: 0, end: 0 };
+    login(&mut rd, &ctx.cfg)?;
+    let _ = send(&mut rd, "QUIT\r\n");
+    Ok(())
+}
+
 pub fn run(ctx: ConnCtx) {
     let mut backoff = 1;
     loop {
+        if ctx.q.is_down(ctx.idx) {
+            std::thread::sleep(Duration::from_secs(backoff));
+            backoff = (backoff * 2).min(30);
+            if !ctx.q.is_down(ctx.idx) {
+                continue;
+            }
+            match probe(&ctx) {
+                Ok(()) => {
+                    eprintln!("[{}] reachable again", ctx.cfg.name);
+                    ctx.st.consec_fail.store(0, Relaxed);
+                    ctx.q.set_down(ctx.idx, false);
+                    backoff = 1;
+                }
+                Err(e) => note_error(&ctx, &e),
+            }
+            continue;
+        }
         // Only connect when there is work.
         let Some(first) = pop_live(&ctx, Some(Duration::from_secs(5))) else {
             if ctx.q.is_closed() {
@@ -261,11 +340,13 @@ pub fn run(ctx: ConnCtx) {
         match session(&ctx, &mut inflight) {
             Ok(()) => backoff = 1,
             Err(e) => {
-                let n = ctx.st.errors.fetch_add(1, Relaxed);
-                if n < 5 || n % 100 == 0 {
-                    eprintln!("[{}] {e}", ctx.cfg.name);
-                }
+                note_error(&ctx, &e);
                 ctx.q.give_back(ctx.idx, inflight.drain(..).collect());
+                let fails = ctx.st.consec_fail.fetch_add(1, Relaxed) + 1;
+                if fails >= DOWN_AFTER && ctx.st.live.load(Relaxed) == 0 && !ctx.q.is_down(ctx.idx) {
+                    eprintln!("[{}] marked down after {fails} failed connection attempts", ctx.cfg.name);
+                    ctx.q.set_down(ctx.idx, true);
+                }
                 std::thread::sleep(Duration::from_secs(backoff));
                 backoff = (backoff * 2).min(30);
             }
@@ -277,6 +358,7 @@ fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>) -> io::Result<()> {
     let s = connect(&ctx.cfg, &ctx.tls)?;
     let mut rd = Rd { s, buf: vec![0; 8 << 20], start: 0, end: 0 };
     login(&mut rd, &ctx.cfg)?;
+    ctx.st.consec_fail.store(0, Relaxed);
     ctx.st.live.fetch_add(1, Relaxed);
     struct Live<'a>(&'a AtomicU64);
     impl Drop for Live<'_> {
@@ -327,6 +409,7 @@ fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>) -> io::Result<()> {
                 let w = inflight.pop_front().unwrap();
                 sent -= 1;
                 ctx.st.bytes.fetch_add((e - s) as u64, Relaxed);
+                LIMIT.consume((e - s) as u64);
                 ctx.q.record(ctx.idx, true, w.tried != 0);
                 match yenc::decode(&rd.buf[s..e], &mut out) {
                     Ok((info, crc)) => {

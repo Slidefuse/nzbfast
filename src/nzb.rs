@@ -19,6 +19,8 @@ pub struct NzbFile {
 pub struct Nzb {
     pub name: String,
     pub files: Vec<NzbFile>,
+    /// Archive password from `<head><meta type="password">`.
+    pub password: Option<String>,
 }
 
 pub fn xml_unescape(s: &str) -> String {
@@ -116,7 +118,26 @@ pub fn parse(text: &str, name: String) -> Result<Nzb, String> {
     if files.is_empty() {
         return Err("NZB has no files".into());
     }
-    Ok(Nzb { name, files })
+    Ok(Nzb { name, files, password: head_meta(text, "password") })
+}
+
+/// Value of `<meta type="KIND">value</meta>` inside the NZB `<head>`.
+fn head_meta(text: &str, kind: &str) -> Option<String> {
+    let h = text.find("<head")?;
+    let end = h + text[h..].find("</head>")?;
+    let head = &text[h..end];
+    let mut pos = 0;
+    while let Some(i) = head[pos..].find("<meta") {
+        let s = pos + i;
+        let te = s + head[s..].find('>')?;
+        let ce = te + head[te..].find("</meta>")?;
+        if attr(&head[s..te], "type").is_some_and(|t| t.eq_ignore_ascii_case(kind)) {
+            let v = xml_unescape(head[te + 1..ce].trim());
+            return (!v.is_empty()).then_some(v);
+        }
+        pos = ce;
+    }
+    None
 }
 
 pub fn load(path: &str) -> Result<Nzb, String> {
