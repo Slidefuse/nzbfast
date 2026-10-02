@@ -23,6 +23,8 @@ pub struct SStats {
     pub crc_errors: AtomicU64,
     /// Connection attempts that failed in a row (reset by any successful login).
     pub consec_fail: AtomicU64,
+    /// Unusual per-article replies seen (logged for the first few).
+    pub odd_replies: AtomicU64,
     pub last_error: std::sync::Mutex<String>,
 }
 
@@ -314,6 +316,13 @@ fn probe(ctx: &ConnCtx) -> io::Result<()> {
     Ok(())
 }
 
+/// Replies to BODY that mean "not available here" rather than a broken session:
+/// any 4xx/5xx except service/auth/connection-level codes. Some servers answer
+/// malformed message-ids with 412 or 501, for example.
+fn article_unavailable(code: &str) -> bool {
+    (code.starts_with('4') || code.starts_with('5')) && !matches!(code, "400" | "401" | "403" | "480" | "481" | "482" | "502" | "503")
+}
+
 pub fn run(ctx: ConnCtx) {
     let mut backoff = 1;
     loop {
@@ -347,7 +356,9 @@ pub fn run(ctx: ConnCtx) {
             Ok(()) => backoff = 1,
             Err(e) => {
                 note_error(&ctx, &e);
-                ctx.q.give_back(ctx.idx, inflight.drain(..).collect());
+                for w in ctx.q.give_back(ctx.idx, inflight.drain(..).collect()) {
+                    w.job.on_missing(w.file, w.seg, &ctx.q);
+                }
                 let fails = ctx.st.consec_fail.fetch_add(1, Relaxed) + 1;
                 if fails >= DOWN_AFTER && ctx.st.live.load(Relaxed) == 0 && !ctx.q.is_down(ctx.idx) {
                     eprintln!("[{}] marked down after {fails} failed connection attempts", ctx.cfg.name);
@@ -431,9 +442,12 @@ fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>) -> io::Result<()> {
                     }
                 }
             }
-            "430" | "423" | "451" => {
+            c if article_unavailable(c) => {
                 let w = inflight.pop_front().unwrap();
                 sent -= 1;
+                if !matches!(c, "430" | "423" | "451") && ctx.st.odd_replies.fetch_add(1, Relaxed) < 5 {
+                    eprintln!("[{}] {} for {} (treated as missing)", ctx.cfg.name, &status[..status.len().min(60)], w.job.msgid(w.file, w.seg));
+                }
                 ctx.st.missing.fetch_add(1, Relaxed);
                 ctx.q.record(ctx.idx, false, w.tried != 0);
                 ctx.q.record_miss_time(ctx.idx, since.as_micros() as u64);

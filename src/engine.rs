@@ -1121,55 +1121,24 @@ fn move_tree(src: &Path, dst: &Path, ctr: &AtomicU64, threads: usize, done: &mut
     Ok(n)
 }
 
-/// Copies with O_DIRECT on the destination where possible: no page-cache copy, no
-/// dirty-page writeback storms, and parallel writers do not serialize on the inode.
-fn copy_file(src: &Path, dst: &Path, ctr: &AtomicU64, threads: usize) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    const SEG: u64 = 64 << 20;
-    const BUF: usize = 8 << 20;
-    const ALIGN: usize = 4096;
+/// Copies through the page cache with one writer per file and one fsync at the end:
+/// the NFS client then streams large asynchronous WRITEs and commits once per file,
+/// which the NAS absorbs far faster than per-write commits (O_DIRECT) or several
+/// writers contending for the same inode.
+fn copy_file(src: &Path, dst: &Path, ctr: &AtomicU64, _threads: usize) -> io::Result<()> {
     let s = File::open(src)?;
     let len = s.metadata()?.len();
-    let b = OpenOptions::new().write(true).create(true).truncate(true).open(dst)?;
-    let direct = if outfile::O_DIRECT != 0 { OpenOptions::new().write(true).custom_flags(outfile::O_DIRECT).open(dst).ok() } else { None };
-    let next = AtomicU64::new(0);
-    let err: Mutex<Option<io::Error>> = Mutex::new(None);
-    let n = threads.min(len.div_ceil(SEG) as usize).max(1);
-    std::thread::scope(|sc| {
-        for _ in 0..n {
-            sc.spawn(|| {
-                let mut raw = vec![0u8; BUF + ALIGN];
-                let shift = raw.as_ptr().align_offset(ALIGN);
-                let buf = &mut raw[shift..shift + BUF];
-                loop {
-                    let off = next.fetch_add(1, Relaxed) * SEG;
-                    if off >= len || err.lock().unwrap().is_some() {
-                        return;
-                    }
-                    let end = (off + SEG).min(len);
-                    let mut pos = off;
-                    while pos < end {
-                        let k = ((end - pos) as usize).min(BUF);
-                        let r = s.read_exact_at(&mut buf[..k], pos).and_then(|_| match &direct {
-                            // Unaligned tails go through the page cache.
-                            Some(d) if k % ALIGN == 0 => d.write_all_at(&buf[..k], pos),
-                            _ => b.write_all_at(&buf[..k], pos),
-                        });
-                        if let Err(e) = r {
-                            *err.lock().unwrap() = Some(e);
-                            return;
-                        }
-                        ctr.fetch_add(k as u64, Relaxed);
-                        pos += k as u64;
-                    }
-                }
-            });
-        }
-    });
-    if let Some(e) = err.into_inner().unwrap() {
-        return Err(e);
+    let d = OpenOptions::new().write(true).create(true).truncate(true).open(dst)?;
+    let mut buf = vec![0u8; 8 << 20];
+    let mut pos = 0u64;
+    while pos < len {
+        let k = ((len - pos) as usize).min(buf.len());
+        s.read_exact_at(&mut buf[..k], pos)?;
+        d.write_all_at(&buf[..k], pos)?;
+        ctr.fetch_add(k as u64, Relaxed);
+        pos += k as u64;
     }
-    b.sync_all()
+    d.sync_all()
 }
 
 fn count_files(dir: &Path) -> usize {

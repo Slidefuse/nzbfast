@@ -31,6 +31,8 @@ pub struct Work {
     pub seg: u32,
     /// Bitmask of server indexes already tried.
     pub tried: u64,
+    /// Times this item was in flight when a connection failed.
+    pub bounces: u8,
 }
 
 struct Q {
@@ -208,10 +210,25 @@ impl Queues {
         self.cv.notify_all();
     }
 
-    /// Returns work items to the queue after a connection failure.
-    pub fn give_back(&self, server: usize, items: Vec<Work>) {
+    /// Returns work items to the queue after a connection failure. An item that was
+    /// in flight through several failures (e.g. one the server chokes on) is not
+    /// tried on that server again; items with no server left are returned.
+    pub fn give_back(&self, server: usize, items: Vec<Work>) -> Vec<Work> {
+        let mut gone = vec![];
+        let mut back = vec![];
+        for mut w in items {
+            w.bounces = w.bounces.saturating_add(1);
+            if w.bounces >= 3 {
+                w.bounces = 0;
+                if let Some(w) = self.retry_elsewhere(server, w) {
+                    gone.push(w);
+                }
+            } else {
+                back.push(w);
+            }
+        }
         let mut q = self.m.lock().unwrap();
-        for w in items.into_iter().rev() {
+        for w in back.into_iter().rev() {
             if w.tried == 0 {
                 q.main.push_front(w);
             } else {
@@ -220,6 +237,7 @@ impl Queues {
         }
         drop(q);
         self.cv.notify_all();
+        gone
     }
 
     /// Picks the server an article should be tried on next, given the servers in

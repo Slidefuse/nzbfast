@@ -58,12 +58,13 @@ pub fn gen(out: &Path, releases: &[String]) -> io::Result<()> {
 struct Store {
     data: Vec<u8>,
     idx: HashMap<String, (usize, usize)>,
-    /// Message-ids answered with 430 (simulated missing articles).
-    drop: std::collections::HashSet<String>,
+    /// Message-ids answered with an error (simulated missing articles) and the reply.
+    drop: HashMap<String, String>,
 }
 
-/// `drop`: list of `substring:every` rules; ids containing `substring` whose part
-/// number is divisible by `every` are reported missing (every=0 drops all matches).
+/// `drop`: list of `substring:every[:code]` rules; ids containing `substring` whose part
+/// number is divisible by `every` are reported missing (every=0 drops all matches),
+/// with reply `code` (default 430).
 pub fn serve(dir: &Path, port: u16, tls: bool, drop_rules: &[String]) -> io::Result<()> {
     let data = fs::read(dir.join("articles.bin"))?;
     let mut idx = HashMap::new();
@@ -72,14 +73,16 @@ pub fn serve(dir: &Path, port: u16, tls: bool, drop_rules: &[String]) -> io::Res
         let (Some(id), Some(o), Some(l)) = (it.next(), it.next(), it.next()) else { continue };
         idx.insert(id.to_string(), (o.parse().unwrap(), l.parse().unwrap()));
     }
-    let mut drop = std::collections::HashSet::new();
+    let mut drop = HashMap::new();
     for id in idx.keys() {
         for r in drop_rules {
-            let (sub, every) = r.split_once(':').unwrap_or((r.as_str(), "0"));
-            let every: usize = every.parse().unwrap_or(0);
+            let mut it = r.splitn(3, ':');
+            let sub = it.next().unwrap_or("");
+            let every: usize = it.next().unwrap_or("0").parse().unwrap_or(0);
+            let code = it.next().unwrap_or("430");
             let part: usize = id.rsplit('.').next().and_then(|t| t.split('@').next()).and_then(|n| n.parse().ok()).unwrap_or(1);
             if id.contains(sub) && (every == 0 || part % every == every - 1) {
-                drop.insert(id.clone());
+                drop.insert(id.clone(), code.to_string());
             }
         }
     }
@@ -132,9 +135,10 @@ fn handle<S: Read + Write>(mut s: S, st: &Store) -> io::Result<()> {
             let up = line.to_ascii_uppercase();
             if up.starts_with("BODY ") {
                 let id = line[5..].trim();
-                match st.idx.get(id).filter(|_| !st.drop.contains(id)) {
-                    Some(&(o, l)) => s.write_all(&st.data[o..o + l])?,
-                    None => s.write_all(b"430 no such article\r\n")?,
+                match (st.drop.get(id), st.idx.get(id)) {
+                    (Some(code), _) => s.write_all(format!("{code} simulated failure\r\n").as_bytes())?,
+                    (None, Some(&(o, l))) => s.write_all(&st.data[o..o + l])?,
+                    (None, None) => s.write_all(b"430 no such article\r\n")?,
                 }
             } else if up.starts_with("AUTHINFO USER") {
                 s.write_all(b"381 more\r\n")?;

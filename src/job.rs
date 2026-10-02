@@ -407,7 +407,7 @@ impl Job {
         let mut v = vec![];
         for (i, f) in self.files.iter().enumerate() {
             if !f.skip {
-                v.push(Work { job: self.clone(), file: i as u32, seg: 0, tried: 0 });
+                v.push(Work { job: self.clone(), file: i as u32, seg: 0, tried: 0, bounces: 0 });
             }
         }
         if v.is_empty() {
@@ -475,7 +475,7 @@ impl Job {
                 continue;
             }
             for s in 1..self.files[i].segs.len() {
-                rest.push(Work { job: self.clone(), file: i as u32, seg: s as u32, tried: 0 });
+                rest.push(Work { job: self.clone(), file: i as u32, seg: s as u32, tried: 0, bounces: 0 });
                 remaining += 1;
             }
         }
@@ -1483,7 +1483,7 @@ impl Job {
                     r.outs.insert(i as u32, o);
                     r.paths.push(p);
                     for s in 0..self.files[i].segs.len() {
-                        work.push(Work { job: self.clone(), file: i as u32, seg: s as u32, tried: 0 });
+                        work.push(Work { job: self.clone(), file: i as u32, seg: s as u32, tried: 0, bounces: 0 });
                     }
                     self.enc_total.fetch_add(self.files[i].segs.iter().map(|s| s.bytes as u64).sum(), Relaxed);
                 }
