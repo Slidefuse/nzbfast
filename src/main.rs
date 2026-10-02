@@ -253,12 +253,13 @@ fn get(args: &[String]) {
                     prev[i] = b;
                     tot += d;
                     parts.push_str(&format!(
-                        " | {} {:.2}/{} {:.0}%/{:.0}%",
+                        " | {} {:.2}/{} {:.0}%/{:.0}% {:.0}ms",
                         names[i],
                         d as f64 * 8.0 / 1e9,
                         s.live.load(Relaxed),
                         q.hit_rate(i) * 100.0,
-                        q.retry_rate(i) * 100.0
+                        q.retry_rate(i) * 100.0,
+                        q.miss_ms(i)
                     ));
                 }
                 let n = nic_rx(&nic);

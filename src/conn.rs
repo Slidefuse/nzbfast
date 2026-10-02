@@ -289,6 +289,7 @@ fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>) -> io::Result<()> {
     let mut out: Vec<u8> = Vec::with_capacity(1 << 20);
     let mut req = String::with_capacity(4096);
     let mut sent = 0usize; // inflight[..sent] have been requested
+    let mut last_resp = std::time::Instant::now();
     loop {
         // Top up the pipeline.
         while inflight.len() < ctx.depth {
@@ -318,6 +319,8 @@ fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>) -> io::Result<()> {
         }
         let status = rd.line()?;
         let code = status.get(..3).unwrap_or("");
+        let since = last_resp.elapsed();
+        last_resp = std::time::Instant::now();
         match code {
             "222" => {
                 let (s, e) = rd.block(&fin)?;
@@ -345,6 +348,7 @@ fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>) -> io::Result<()> {
                 sent -= 1;
                 ctx.st.missing.fetch_add(1, Relaxed);
                 ctx.q.record(ctx.idx, false, w.tried != 0);
+                ctx.q.record_miss_time(ctx.idx, since.as_micros() as u64);
                 if let Some(w) = ctx.q.retry_elsewhere(ctx.idx, w) {
                     w.job.on_missing(w.file, w.seg, &ctx.q);
                 }

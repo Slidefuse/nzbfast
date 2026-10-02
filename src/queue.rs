@@ -64,6 +64,8 @@ struct Health {
     /// Articles that other servers lacked.
     retry: Rate,
     sample: AtomicU64,
+    /// EWMA of how long a "430 no such article" takes to arrive, in microseconds.
+    miss_us: AtomicU64,
 }
 
 impl Health {
@@ -110,6 +112,17 @@ impl Queues {
         }
     }
 
+    /// Records how long a miss took (time since the previous response on that connection).
+    pub fn record_miss_time(&self, server: usize, us: u64) {
+        let h = &self.health[server].miss_us;
+        let old = h.load(Relaxed);
+        h.store(if old == 0 { us } else { (old * 7 + us) / 8 }, Relaxed);
+    }
+
+    pub fn miss_ms(&self, server: usize) -> f64 {
+        self.health[server].miss_us.load(Relaxed) as f64 / 1000.0
+    }
+
     pub fn retry_rate(&self, server: usize) -> f64 {
         self.health[server].retry_rate()
     }
@@ -125,7 +138,9 @@ impl Queues {
         }
         let best = (0..self.prio.len()).filter(|&s| self.prio[s] == self.min_prio).map(|s| self.health[s].rate()).fold(0.0, f64::max);
         let h = &self.health[server];
-        h.rate() >= 0.85 * best || h.sample.fetch_add(1, Relaxed) % 32 == 0
+        // Miss latency is reported but not used: on long links the gap between
+        // responses is dominated by transfer time, not by the server's lookup.
+        h.rate() >= 0.5 * best || h.sample.fetch_add(1, Relaxed) % 32 == 0
     }
 
     pub fn push_back(&self, items: impl IntoIterator<Item = Work>) {
