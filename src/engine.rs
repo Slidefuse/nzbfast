@@ -137,8 +137,7 @@ struct Done {
 struct MoveTask {
     nzo: String,
     src: PathBuf,
-    tmp: PathBuf,
-    dest: PathBuf,
+    meta: Meta,
     reserved: u64,
 }
 
@@ -198,6 +197,12 @@ pub struct Engine {
     dirty_s: AtomicBool,
     /// Per server name: day ("YYYY-MM-DD") -> bytes.
     pub daily: Mutex<BTreeMap<String, BTreeMap<String, u64>>>,
+    /// Destination folders claimed by moves in progress.
+    dest_taken: Mutex<std::collections::HashSet<PathBuf>>,
+    /// Head-of-queue job waiting for staging space, and since when.
+    head_wait: Mutex<Option<(String, Instant)>>,
+    /// NZBs of completed jobs, deleted once the history recording that is saved.
+    nzb_trash: Mutex<Vec<PathBuf>>,
     _lock: File,
 }
 
@@ -281,10 +286,18 @@ impl Engine {
             fs::create_dir_all(&d).map_err(|e| format!("{}: {e}", d.display()))?;
         }
         fs::create_dir_all(&cfg.complete_dir).map_err(|e| format!("{}: {e}", cfg.complete_dir))?;
-        // Work left in staging by a previous run is restarted from scratch.
+        // Jobs that were being moved resume their move (their files are complete in
+        // staging); other work left in staging is restarted from scratch.
+        let hist: Vec<Hist> = fs::read(cfg.state_dir.join("history.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let resumable: std::collections::HashSet<String> = hist
+            .iter()
+            .filter(|h| h.status == "Moving" && cfg.staging_dir.join(&h.m.nzo).is_dir())
+            .map(|h| h.m.nzo.clone())
+            .collect();
         if let Ok(rd) = fs::read_dir(&cfg.staging_dir) {
             for e in rd.flatten() {
-                if e.file_name().to_string_lossy().starts_with("SABnzbd_nzo_") {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if n.starts_with("SABnzbd_nzo_") && !resumable.contains(&n) {
                     let _ = fs::remove_dir_all(e.path());
                 }
             }
@@ -333,15 +346,27 @@ impl Engine {
 
         // Restore state.
         let qf: QueueFile = fs::read(cfg.state_dir.join("queue.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        let hist: Vec<Hist> = fs::read(cfg.state_dir.join("history.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let daily = fs::read(cfg.state_dir.join("servers.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let mut queue: Vec<Entry> = vec![];
         let mut history = VecDeque::new();
-        for h in hist {
+        let mut resume = vec![];
+        for mut h in hist {
             if h.status == "Completed" || h.status == "Failed" {
                 history.push_back(h);
+            } else if resumable.contains(&h.m.nzo) {
+                // Partial copies under an older naming scheme are redone from staging.
+                if !h.tmp_dest.is_empty() && !h.tmp_dest.ends_with(&h.m.nzo) {
+                    let _ = fs::remove_dir_all(&h.tmp_dest);
+                }
+                resume.push(h.m.clone());
+                history.push_back(h);
+            } else if h.status == "Moving" && !h.storage.is_empty() && Path::new(&h.storage).is_dir() {
+                // The move had finished; only the status update was lost.
+                h.status = "Completed".into();
+                h.tmp_dest = String::new();
+                history.push_back(h);
             } else {
-                // Interrupted while moving: download again.
+                // Interrupted before its files were complete: download again.
                 if !h.tmp_dest.is_empty() {
                     let _ = fs::remove_dir_all(&h.tmp_dest);
                 }
@@ -382,12 +407,26 @@ impl Engine {
             dirty_h: AtomicBool::new(true),
             dirty_s: AtomicBool::new(false),
             daily: Mutex::new(daily),
+            dest_taken: Mutex::new(Default::default()),
+            head_wait: Mutex::new(None),
+            nzb_trash: Mutex::new(vec![]),
             _lock: lock,
         });
         let rx = Arc::new(Mutex::new(move_rx));
         for _ in 0..eng.cfg.mover_jobs.max(1) {
             let (e, rx) = (eng.clone(), rx.clone());
             std::thread::spawn(move || e.mover(rx));
+        }
+        for m in resume {
+            eprintln!("resuming move of {}", m.name);
+            eng.reserved.fetch_add(m.bytes, Relaxed);
+            eng.move_backlog.fetch_add(m.bytes, Relaxed);
+            let _ = eng.move_tx.lock().unwrap().send(MoveTask {
+                nzo: m.nzo.clone(),
+                src: eng.cfg.staging_dir.join(&m.nzo),
+                reserved: m.bytes,
+                meta: m,
+            });
         }
         let e = eng.clone();
         std::thread::spawn(move || e.run_loop());
@@ -774,13 +813,34 @@ impl Engine {
                 if active >= self.cfg.active_jobs {
                     return;
                 }
-                let Some(i) = st.queue.iter().position(|e| e.run.is_none() && !e.loading && !e.m.paused) else { return };
-                let need = st.queue[i].m.bytes;
+                let eligible = |e: &Entry| e.run.is_none() && !e.loading && !e.m.paused;
+                let Some(head) = st.queue.iter().position(eligible) else { return };
                 // Always allow one job, even if it alone exceeds the budget.
                 let busy = active > 0 || self.moving.load(Relaxed) > 0;
-                if busy && self.reserved.load(Relaxed) + need > limit {
-                    return;
-                }
+                let reserved = self.reserved.load(Relaxed);
+                let fits = |e: &Entry| !busy || reserved + e.m.bytes <= limit;
+                let i = if fits(&st.queue[head]) {
+                    *self.head_wait.lock().unwrap() = None;
+                    head
+                } else {
+                    // A big job waiting for staging space should not idle the network:
+                    // start smaller ones behind it, unless it has waited long enough
+                    // that space must be left to free up for it.
+                    let mut hw = self.head_wait.lock().unwrap();
+                    let nzo = &st.queue[head].m.nzo;
+                    if hw.as_ref().is_none_or(|(n, _)| n != nzo) {
+                        *hw = Some((nzo.clone(), Instant::now()));
+                    }
+                    if hw.as_ref().is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(300)) {
+                        return;
+                    }
+                    drop(hw);
+                    match st.queue.iter().enumerate().skip(head + 1).filter(|(_, e)| eligible(e)).take(64).find(|(_, e)| fits(e)) {
+                        Some((j, _)) => j,
+                        None => return,
+                    }
+                };
+                let need = st.queue[i].m.bytes;
                 st.queue[i].loading = true;
                 (st.queue[i].m.nzo.clone(), need)
             };
@@ -830,14 +890,16 @@ impl Engine {
     }
 
     /// Picks `<cat dir>/<name>`, adding .1, .2, ... if taken.
-    fn unique_dest(&self, m: &Meta) -> (PathBuf, PathBuf) {
+    /// Picks and claims `<cat dir>/<name>`, adding .1, .2, ... if taken. Runs on a
+    /// mover thread: these lookups can be slow on a busy NFS mount.
+    fn unique_dest(&self, m: &Meta) -> PathBuf {
         let dir = self.cat_dir(&m.cat);
         let mut k = 0;
         loop {
             let name = if k == 0 { m.name.clone() } else { format!("{}.{k}", m.name) };
-            let (dest, tmp) = (dir.join(&name), dir.join(format!("_FAST_{name}")));
-            if !dest.exists() && !tmp.exists() {
-                return (dest, tmp);
+            let dest = dir.join(&name);
+            if !self.dest_taken.lock().unwrap().contains(&dest) && !dest.exists() && self.dest_taken.lock().unwrap().insert(dest.clone()) {
+                return dest;
             }
             k += 1;
         }
@@ -849,6 +911,8 @@ impl Engine {
                 Ok(d) => d,
                 Err(_) => return,
             };
+            // Only bookkeeping happens under the store lock; file system work is done
+            // after releasing it (or by the movers).
             let mut st = self.store.lock().unwrap();
             if let Some((job, reserved)) = st.zombies.remove(&d.id) {
                 drop(st);
@@ -871,32 +935,28 @@ impl Engine {
                 downloaded: d.downloaded,
                 log: d.parts.clone(),
             };
+            let mut cleanup = vec![];
             if d.ok {
-                let (dest, tmp) = self.unique_dest(&h.m);
-                let _ = fs::create_dir_all(&tmp);
-                h.storage = dest.to_string_lossy().into_owned();
-                h.tmp_dest = tmp.to_string_lossy().into_owned();
                 self.move_backlog.fetch_add(run.reserved, Relaxed);
-                let _ = self.move_tx.lock().unwrap().send(MoveTask {
-                    nzo: h.m.nzo.clone(),
-                    src: run.job.work.clone(),
-                    tmp,
-                    dest,
-                    reserved: run.reserved,
-                });
+                let _ = self.move_tx.lock().unwrap().send(MoveTask { nzo: h.m.nzo.clone(), src: run.job.work.clone(), meta: h.m.clone(), reserved: run.reserved });
             } else {
                 h.fail_message = d.parts.first().cloned().unwrap_or_else(|| "failed".into());
-                let _ = fs::remove_dir_all(&run.job.work);
-                self.reserved.fetch_sub(run.reserved, Relaxed);
                 self.jobs_failed.fetch_add(1, Relaxed);
             }
             st.history.push_front(h);
             while st.history.len() > self.cfg.history_keep.max(100) {
                 if let Some(old) = st.history.pop_back() {
-                    let _ = fs::remove_file(self.nzb_path(&old.m.nzo));
+                    cleanup.push(self.nzb_path(&old.m.nzo));
                 }
             }
             drop(st);
+            if !d.ok {
+                let _ = fs::remove_dir_all(&run.job.work);
+                self.reserved.fetch_sub(run.reserved, Relaxed);
+            }
+            for p in cleanup {
+                let _ = fs::remove_file(p);
+            }
             self.touch_history();
             self.queue_ver.fetch_add(1, Relaxed);
             self.dirty_q.store(true, Relaxed);
@@ -910,25 +970,53 @@ impl Engine {
             let Ok(t) = rx.lock().unwrap().recv() else { return };
             self.moving.fetch_add(1, Relaxed);
             let t0 = Instant::now();
-            let res = move_tree(&t.src, &t.tmp, &self.moved, self.cfg.mover_threads.max(1))
-                .and_then(|n| if n == 0 { Err(io::Error::other("no files were produced")) } else { Ok(()) })
-                .and_then(|_| fs::rename(&t.tmp, &t.dest));
+            // The partial copy has a fixed name, so a move interrupted by a restart
+            // picks up where it was; the final name is chosen when it is complete.
+            let tmp = self.cat_dir(&t.meta.cat).join(format!("_FAST_{}", t.nzo));
+            // Staging space is handed back file by file, so new jobs can start while
+            // a large job is still being copied.
+            let mut left = t.reserved;
+            let mut release = |b: u64| {
+                let r = b.min(left);
+                left -= r;
+                self.reserved.fetch_sub(r, Relaxed);
+                self.move_backlog.fetch_sub(r, Relaxed);
+                self.kick.notify();
+            };
+            let res = fs::create_dir_all(&tmp)
+                .and_then(|_| move_tree(&t.src, &tmp, &self.moved, self.cfg.mover_threads.max(1), &mut release))
+                // After a restart some files may already be in place: count what is there.
+                .and_then(|_| if count_files(&tmp) == 0 { Err(io::Error::other("no files were produced")) } else { Ok(()) })
+                .and_then(|_| {
+                    let dest = self.unique_dest(&t.meta);
+                    // Recorded before the rename, so a restart right after it can tell
+                    // the move finished.
+                    if let Some(h) = self.store.lock().unwrap().history.iter_mut().find(|h| h.m.nzo == t.nzo) {
+                        h.storage = dest.to_string_lossy().into_owned();
+                    }
+                    self.touch_history();
+                    let r = fs::rename(&tmp, &dest).map(|_| dest.clone());
+                    self.dest_taken.lock().unwrap().remove(&dest);
+                    r
+                });
             if res.is_err() {
-                let _ = fs::remove_dir_all(&t.tmp);
+                let _ = fs::remove_dir_all(&tmp);
             }
             let _ = fs::remove_dir_all(&t.src);
-            self.reserved.fetch_sub(t.reserved, Relaxed);
-            self.move_backlog.fetch_sub(t.reserved, Relaxed);
+            release(u64::MAX);
             self.moving.fetch_sub(1, Relaxed);
+            let mut done_nzb = None;
             let mut st = self.store.lock().unwrap();
             if let Some(h) = st.history.iter_mut().find(|h| h.m.nzo == t.nzo) {
                 h.postproc_time = t0.elapsed().as_secs();
                 h.completed = unix_now();
                 match &res {
-                    Ok(()) => {
+                    Ok(dest) => {
+                        h.storage = dest.to_string_lossy().into_owned();
+                        h.tmp_dest = String::new();
                         h.status = "Completed".into();
                         self.jobs_ok.fetch_add(1, Relaxed);
-                        let _ = fs::remove_file(self.nzb_path(&t.nzo));
+                        done_nzb = Some(self.nzb_path(&t.nzo));
                     }
                     Err(e) => {
                         h.status = "Failed".into();
@@ -938,6 +1026,9 @@ impl Engine {
                 }
             }
             drop(st);
+            if let Some(p) = done_nzb {
+                self.nzb_trash.lock().unwrap().push(p);
+            }
             self.touch_history();
             self.kick.notify();
         }
@@ -952,28 +1043,38 @@ impl Engine {
         if !(dq || dh || ds) {
             return;
         }
-        let (qb, hb) = {
+        // NZBs whose job is recorded as completed in the snapshot taken below; they are
+        // deleted only once that snapshot is on disk.
+        let trash = if dh { std::mem::take(&mut *self.nzb_trash.lock().unwrap()) } else { vec![] };
+        // Copy under the lock, serialize after releasing it.
+        let (qf, hist) = {
             let st = self.store.lock().unwrap();
-            let qb = dq.then(|| {
-                let qf = QueueFile {
-                    queue: st.queue.iter().map(|e| e.m.clone()).collect(),
-                    paused: self.paused.load(Relaxed),
-                    limit: conn::LIMIT.rate.load(Relaxed),
-                };
-                serde_json::to_vec(&qf).unwrap_or_default()
+            let qf = dq.then(|| QueueFile {
+                queue: st.queue.iter().map(|e| e.m.clone()).collect(),
+                paused: self.paused.load(Relaxed),
+                limit: conn::LIMIT.rate.load(Relaxed),
             });
-            let hb = dh.then(|| serde_json::to_vec(&st.history).unwrap_or_default());
-            (qb, hb)
+            (qf, dh.then(|| st.history.clone()))
         };
         let dir = &self.cfg.state_dir;
-        if let Some(b) = qb {
-            if let Err(e) = write_atomic(&dir.join("queue.json"), &b) {
+        if let Some(q) = qf {
+            if let Err(e) = write_atomic(&dir.join("queue.json"), &serde_json::to_vec(&q).unwrap_or_default()) {
                 eprintln!("save queue: {e}");
+                self.dirty_q.store(true, Relaxed);
             }
         }
-        if let Some(b) = hb {
-            if let Err(e) = write_atomic(&dir.join("history.json"), &b) {
-                eprintln!("save history: {e}");
+        if let Some(h) = hist {
+            match write_atomic(&dir.join("history.json"), &serde_json::to_vec(&h).unwrap_or_default()) {
+                Ok(()) => {
+                    for p in &trash {
+                        let _ = fs::remove_file(p);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("save history: {e}");
+                    self.dirty_h.store(true, Relaxed);
+                    self.nzb_trash.lock().unwrap().extend(trash);
+                }
             }
         }
         if ds {
@@ -990,8 +1091,8 @@ impl Engine {
 }
 
 /// Moves a directory tree; files that cannot be renamed (other filesystem) are copied
-/// in parallel ranges. Returns the number of files.
-fn move_tree(src: &Path, dst: &Path, ctr: &AtomicU64, threads: usize) -> io::Result<usize> {
+/// in parallel ranges. `done` is called with each file's size. Returns the number of files.
+fn move_tree(src: &Path, dst: &Path, ctr: &AtomicU64, threads: usize, done: &mut dyn FnMut(u64)) -> io::Result<usize> {
     fs::create_dir_all(dst)?;
     let mut n = 0;
     for e in fs::read_dir(src)? {
@@ -1003,31 +1104,43 @@ fn move_tree(src: &Path, dst: &Path, ctr: &AtomicU64, threads: usize) -> io::Res
         let (p, d) = (e.path(), dst.join(&name));
         let ft = e.file_type()?;
         if ft.is_dir() {
-            n += move_tree(&p, &d, ctr, threads)?;
+            n += move_tree(&p, &d, ctr, threads, done)?;
         } else if ft.is_file() {
+            let len = e.metadata().map(|m| m.len()).unwrap_or(0);
             if fs::rename(&p, &d).is_ok() {
-                ctr.fetch_add(e.metadata().map(|m| m.len()).unwrap_or(0), Relaxed);
+                ctr.fetch_add(len, Relaxed);
             } else {
                 copy_file(&p, &d, ctr, threads)?;
+                // Free the staging copy right away.
+                let _ = fs::remove_file(&p);
             }
+            done(len);
             n += 1;
         }
     }
     Ok(n)
 }
 
+/// Copies with O_DIRECT on the destination where possible: no page-cache copy, no
+/// dirty-page writeback storms, and parallel writers do not serialize on the inode.
 fn copy_file(src: &Path, dst: &Path, ctr: &AtomicU64, threads: usize) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     const SEG: u64 = 64 << 20;
+    const BUF: usize = 8 << 20;
+    const ALIGN: usize = 4096;
     let s = File::open(src)?;
     let len = s.metadata()?.len();
-    let d = OpenOptions::new().write(true).create(true).truncate(true).open(dst)?;
+    let b = OpenOptions::new().write(true).create(true).truncate(true).open(dst)?;
+    let direct = if outfile::O_DIRECT != 0 { OpenOptions::new().write(true).custom_flags(outfile::O_DIRECT).open(dst).ok() } else { None };
     let next = AtomicU64::new(0);
     let err: Mutex<Option<io::Error>> = Mutex::new(None);
     let n = threads.min(len.div_ceil(SEG) as usize).max(1);
     std::thread::scope(|sc| {
         for _ in 0..n {
             sc.spawn(|| {
-                let mut buf = vec![0u8; 8 << 20];
+                let mut raw = vec![0u8; BUF + ALIGN];
+                let shift = raw.as_ptr().align_offset(ALIGN);
+                let buf = &mut raw[shift..shift + BUF];
                 loop {
                     let off = next.fetch_add(1, Relaxed) * SEG;
                     if off >= len || err.lock().unwrap().is_some() {
@@ -1036,8 +1149,13 @@ fn copy_file(src: &Path, dst: &Path, ctr: &AtomicU64, threads: usize) -> io::Res
                     let end = (off + SEG).min(len);
                     let mut pos = off;
                     while pos < end {
-                        let k = ((end - pos) as usize).min(buf.len());
-                        if let Err(e) = s.read_exact_at(&mut buf[..k], pos).and_then(|_| d.write_all_at(&buf[..k], pos)) {
+                        let k = ((end - pos) as usize).min(BUF);
+                        let r = s.read_exact_at(&mut buf[..k], pos).and_then(|_| match &direct {
+                            // Unaligned tails go through the page cache.
+                            Some(d) if k % ALIGN == 0 => d.write_all_at(&buf[..k], pos),
+                            _ => b.write_all_at(&buf[..k], pos),
+                        });
+                        if let Err(e) = r {
                             *err.lock().unwrap() = Some(e);
                             return;
                         }
@@ -1051,5 +1169,19 @@ fn copy_file(src: &Path, dst: &Path, ctr: &AtomicU64, threads: usize) -> io::Res
     if let Some(e) = err.into_inner().unwrap() {
         return Err(e);
     }
-    d.sync_all()
+    b.sync_all()
+}
+
+fn count_files(dir: &Path) -> usize {
+    fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| match e.file_type() {
+                    Ok(t) if t.is_dir() => count_files(&e.path()),
+                    Ok(t) if t.is_file() => 1,
+                    _ => 0,
+                })
+                .sum()
+        })
+        .unwrap_or(0)
 }

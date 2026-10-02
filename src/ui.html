@@ -122,7 +122,7 @@ td.act button{margin-left:4px}
   <div class="panel speed">
     <div><span class="big" id="spd">0.00</span><span class="unit" id="spdu">Gbit/s</span></div>
     <div class="sub"><span id="spdB">0 MB/s</span> payload · NIC <span id="nic">0</span></div>
-    <div class="sub">1 s <span id="r1">0</span> · 5 s <span id="r5">0</span> · peak <span id="peak">0</span></div>
+    <div class="sub">5 s <span id="r5">0</span> · peak <span id="peak">0</span> <span style="color:var(--faint)">(1 s average)</span></div>
   </div>
   <div class="panel graphwrap">
     <div class="graphhead">
@@ -219,7 +219,7 @@ const COLORS = ["#5ad1ff", "#3ddc84", "#ffb547", "#b48cff", "#ff7ab6", "#7cf5e6"
 const N = 3000;                       // samples kept (5 min at 10 Hz)
 let INIT = null, S = null, dirty = false, win = 1200;
 const ring = {rx: new Float32Array(N), nic: new Float32Array(N), srv: [], len: 0, head: 0};
-let lastK = -1, peak = 0;
+let lastK = -1, peak = 0, ringK = -1;
 
 // ---------- formatting ----------
 function bits(Bps) { // bytes/s -> [value, unit]
@@ -310,8 +310,9 @@ function connect() {
   es.onmessage = e => {
     S = JSON.parse(e.data);
     let steps = lastK < 0 ? 1 : Math.min(50, Math.max(1, S.k - lastK));
-    lastK = S.k;
-    while (steps--) push(S.rx, S.nic, S.srv.map(s => s[0]));
+    lastK = S.k; ringK = S.k;
+    if (S.r1 > peak) peak = S.r1;
+    while (steps--) push(S.rx, S.nic, S.srv.map(s => s[12] !== undefined ? s[12] : s[0]));
     dirty = true;
   };
   es.onopen = () => cls($("#conn"), "on");
@@ -322,12 +323,13 @@ function push(rx, nic, srv) {
   ring.rx[h] = rx; ring.nic[h] = nic;
   for (let i = 0; i < ring.srv.length; i++) ring.srv[i][h] = srv[i] || 0;
   ring.head = (h + 1) % N; ring.len = Math.min(N, ring.len + 1);
-  if (rx > peak) peak = rx;
 }
 function loadRing(r) {
   ring.len = 0; ring.head = 0; peak = 0; lastK = -1;
   ring.srv = INIT.servers.map(() => new Float32Array(N));
   for (let i = 0; i < r.rx.length; i++) push(r.rx[i], r.nic[i], r.srv.map(a => a[i]));
+  // The ring ends at the newest tick; the first live snapshot re-anchors lastK.
+  ringK = -1;
 }
 function setupServers() {
   const lg = $("#legend"); lg.textContent = "";
@@ -354,6 +356,11 @@ function niceStep(maxBits) {
 }
 let theme = null;
 matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => { theme = null; dirty = true; });
+// Samples are averaged into bins anchored to absolute tick numbers, so a sample
+// never changes bin as the graph scrolls (no shimmer), and the x position of each
+// bin moves smoothly with time.
+const BIN = {300: 2, 1200: 5, 3000: 10};
+const bins = {n: 0, x: null, nic: null, stack: [], ok: null};
 function drawGraph() {
   if (!gw) return;
   if (!theme) { const css = getComputedStyle(document.documentElement); theme = {line: css.getPropertyValue("--line").trim(), dim: css.getPropertyValue("--dim").trim(), text: css.getPropertyValue("--text").trim(), mono: css.getPropertyValue("--mono")}; }
@@ -361,29 +368,38 @@ function drawGraph() {
   cx.setTransform(dpr, 0, 0, dpr, 0, 0);
   cx.clearRect(0, 0, gw, gh);
   const L = 44, R = 6, T = 6, B = 16, pw = gw - L - R, ph = gh - T - B;
-  const ns = ring.srv.length, n = Math.min(win, ring.len), off = win - n;
-  const C = Math.max(1, Math.floor(pw));
-  // Average samples into pixel columns.
-  if (cols.n !== C || cols.stack.length !== ns) { cols.stack = Array.from({length: ns}, () => new Float32Array(C)); cols.nic = new Float32Array(C); cols.cnt = new Float32Array(C); cols.n = C; }
-  for (const a of cols.stack) a.fill(0); cols.nic.fill(0); cols.cnt.fill(0);
-  const start = (ring.head - n + N) % N;
-  for (let i = 0; i < n; i++) {
-    const j = (start + i) % N, c = Math.min(C - 1, Math.floor((off + i) * C / win));
-    for (let s = 0; s < ns; s++) cols.stack[s][c] += ring.srv[s][j];
-    cols.nic[c] += ring.nic[j]; cols.cnt[c]++;
+  const ns = ring.srv.length, b = BIN[win] || 5, nb = Math.ceil(win / b) + 1;
+  if (bins.n !== nb || bins.stack.length !== ns) {
+    bins.n = nb; bins.x = new Float32Array(nb); bins.nic = new Float32Array(nb); bins.ok = new Uint8Array(nb);
+    bins.stack = Array.from({length: ns}, () => new Float32Array(nb));
   }
+  const K = ringK, B0 = Math.floor(K / b);
   let target = 0;
-  for (let c = 0; c < C; c++) {
-    const k = cols.cnt[c]; if (!k) continue;
+  for (let j = 0; j < nb; j++) {
+    const t0 = (B0 - j) * b;
+    let cnt = 0, nic = 0;
+    for (let s = 0; s < ns; s++) bins.stack[s][j] = 0;
+    for (let t = t0; t < t0 + b; t++) {
+      const age = K - t;
+      if (age < 0 || age >= ring.len || age >= win) continue;
+      const idx = (ring.head - 1 - age + 2 * N) % N;
+      for (let s = 0; s < ns; s++) bins.stack[s][j] += ring.srv[s][idx];
+      nic += ring.nic[idx]; cnt++;
+    }
+    bins.ok[j] = cnt > 0 ? 1 : 0;
+    bins.x[j] = L + pw - ((K - (t0 + (b - 1) / 2)) / win) * pw;
+    if (!cnt) continue;
     let acc = 0;
-    for (let s = 0; s < ns; s++) { acc += cols.stack[s][c] / k; cols.stack[s][c] = acc; }
-    cols.nic[c] /= k;
-    target = Math.max(target, acc, cols.nic[c]);
+    for (let s = 0; s < ns; s++) { acc += bins.stack[s][j] / cnt; bins.stack[s][j] = acc; }
+    bins.nic[j] = nic / cnt;
+    target = Math.max(target, acc, bins.nic[j]);
   }
-  target = Math.max(target * 1.12, 1.25e6);
-  yMax = target > yMax ? target : yMax + (target - yMax) * 0.08;
-  const y = v => T + ph - (v / yMax) * ph;
-  // Grid + labels (bits).
+  // Stable axis: pinned just above the line rate once traffic is in that range;
+  // grows at once, shrinks slowly.
+  let top = Math.max(target * 1.1, 1.25e6);
+  if (INIT && INIT.line && target > INIT.line * 0.3) top = Math.max(top, INIT.line * 1.1);
+  yMax = top > yMax ? top : yMax + (top - yMax) * 0.03;
+  const y = v => T + ph - Math.min(v / yMax, 1.02) * ph;
   const step = niceStep(yMax * 8) / 8;
   cx.font = "11px " + theme.mono; cx.textAlign = "right"; cx.textBaseline = "middle";
   for (let v = 0; v <= yMax; v += step) {
@@ -391,47 +407,47 @@ function drawGraph() {
     cx.strokeStyle = cLine; cx.lineWidth = 1; cx.beginPath(); cx.moveTo(L, yy); cx.lineTo(L + pw, yy); cx.stroke();
     cx.fillStyle = cDim; cx.fillText(axis(v), L - 6, yy);
   }
-  // Line-rate reference.
   if (INIT && INIT.line && INIT.line < yMax) {
     const yy = Math.round(y(INIT.line)) + 0.5;
     cx.setLineDash([4, 4]); cx.strokeStyle = "#ff5f5f99"; cx.beginPath(); cx.moveTo(L, yy); cx.lineTo(L + pw, yy); cx.stroke(); cx.setLineDash([]);
     cx.textAlign = "left"; cx.fillStyle = "#ff5f5fcc"; cx.fillText("line " + fbits(INIT.line), L + 4, yy - 8); cx.textAlign = "right";
   }
-  // Stacked areas, top layer first.
-  const first = Math.min(C - 1, Math.floor(off * C / win));
-  for (let s = ns - 1; s >= 0; s--) {
-    const a = cols.stack[s], below = s > 0 ? cols.stack[s - 1] : null;
-    cx.beginPath();
-    cx.moveTo(L + first, y(a[first]));
-    for (let c = first + 1; c < C; c++) cx.lineTo(L + c, y(a[c]));
-    for (let c = C - 1; c >= first; c--) cx.lineTo(L + c, y(below ? below[c] : 0));
-    cx.closePath();
-    const col = COLORS[s % COLORS.length];
-    cx.fillStyle = col + "55"; cx.fill();
-    cx.beginPath(); cx.moveTo(L + first, y(a[first]));
-    for (let c = first + 1; c < C; c++) cx.lineTo(L + c, y(a[c]));
-    cx.strokeStyle = col; cx.lineWidth = 1.2; cx.stroke();
+  cx.save(); cx.beginPath(); cx.rect(L, T - 2, pw, ph + 4); cx.clip();
+  // Oldest bin with data, then newest-to-oldest indexes run right to left.
+  let last = -1;
+  for (let j = 0; j < nb; j++) if (bins.ok[j]) last = j;
+  if (last >= 0) {
+    for (let s = ns - 1; s >= 0; s--) {
+      const a = bins.stack[s], below = s > 0 ? bins.stack[s - 1] : null;
+      cx.beginPath();
+      cx.moveTo(bins.x[last], y(a[last]));
+      for (let j = last - 1; j >= 0; j--) if (bins.ok[j]) cx.lineTo(bins.x[j], y(a[j]));
+      for (let j = 0; j <= last; j++) if (bins.ok[j]) cx.lineTo(bins.x[j], y(below ? below[j] : 0));
+      cx.closePath();
+      const col = COLORS[s % COLORS.length];
+      cx.fillStyle = col + "55"; cx.fill();
+      cx.beginPath(); cx.moveTo(bins.x[last], y(a[last]));
+      for (let j = last - 1; j >= 0; j--) if (bins.ok[j]) cx.lineTo(bins.x[j], y(a[j]));
+      cx.strokeStyle = col; cx.lineWidth = 1.2; cx.stroke();
+    }
+    cx.beginPath(); cx.moveTo(bins.x[last], y(bins.nic[last]));
+    for (let j = last - 1; j >= 0; j--) if (bins.ok[j]) cx.lineTo(bins.x[j], y(bins.nic[j]));
+    cx.strokeStyle = cText; cx.globalAlpha = 0.7; cx.lineWidth = 1; cx.stroke(); cx.globalAlpha = 1;
   }
-  // NIC line.
-  cx.beginPath(); cx.moveTo(L + first, y(cols.nic[first]));
-  for (let c = first + 1; c < C; c++) cx.lineTo(L + c, y(cols.nic[c]));
-  cx.strokeStyle = cText; cx.globalAlpha = 0.65; cx.lineWidth = 1; cx.stroke(); cx.globalAlpha = 1;
-  // Time axis.
+  cx.restore();
   cx.textAlign = "center"; cx.textBaseline = "alphabetic"; cx.fillStyle = cDim;
   const secs = win / 10, tick = secs <= 30 ? 5 : secs <= 120 ? 20 : 60;
   for (let t = 0; t <= secs; t += tick) { const x = L + pw - t / secs * pw; cx.fillText(t ? "-" + t + "s" : "now", Math.min(Math.max(x, L + 12), L + pw - 12), gh - 3); }
-  // Hover.
   const tip = $("#tip");
-  if (hoverX >= L && hoverX < L + pw && ring.len) {
-    const c = Math.floor(hoverX - L);
-    cx.strokeStyle = cText; cx.globalAlpha = .35; cx.beginPath(); cx.moveTo(L + c + .5, T); cx.lineTo(L + c + .5, T + ph); cx.stroke(); cx.globalAlpha = 1;
-    if (cols.cnt[c]) {
-      const tsec = ((C - c) / C * secs).toFixed(1);
-      let s = "-" + tsec + "s\ntotal " + fbits(cols.stack[ns - 1][c]).padStart(13) + "\nNIC   " + fbits(cols.nic[c]).padStart(13);
-      for (let i = 0; i < ns; i++) s += "\n" + INIT.servers[i].name.slice(0, 12).padEnd(12) + " " + fbits(cols.stack[i][c] - (i ? cols.stack[i - 1][c] : 0)).padStart(12);
-      tip.textContent = s; tip.style.display = "block";
-      const x = hoverX + 16 + 220 > gw ? hoverX - 230 : hoverX + 16; tip.style.left = x + "px"; tip.style.top = "40px";
-    }
+  if (hoverX >= L && hoverX < L + pw && last >= 0) {
+    let j = 0, best = 1e9;
+    for (let k = 0; k <= last; k++) if (bins.ok[k] && Math.abs(bins.x[k] - hoverX) < best) { best = Math.abs(bins.x[k] - hoverX); j = k; }
+    const xx = bins.x[j];
+    cx.strokeStyle = cText; cx.globalAlpha = .35; cx.beginPath(); cx.moveTo(xx + .5, T); cx.lineTo(xx + .5, T + ph); cx.stroke(); cx.globalAlpha = 1;
+    let s = "-" + ((L + pw - xx) / pw * secs).toFixed(1) + "s (" + (b / 10).toFixed(1) + "s avg)\ntotal " + fbits(bins.stack[ns - 1][j]).padStart(13) + "\nNIC   " + fbits(bins.nic[j]).padStart(13);
+    for (let i = 0; i < ns; i++) s += "\n" + INIT.servers[i].name.slice(0, 12).padEnd(12) + " " + fbits(bins.stack[i][j] - (i ? bins.stack[i - 1][j] : 0)).padStart(12);
+    tip.textContent = s; tip.style.display = "block";
+    const x = hoverX + 16 + 230 > gw ? hoverX - 240 : hoverX + 16; tip.style.left = x + "px"; tip.style.top = "40px";
   } else tip.style.display = "none";
 }
 cv.addEventListener("mousemove", e => { hoverX = e.offsetX; dirty = true; });
@@ -444,10 +460,10 @@ $("#win").addEventListener("click", e => {
 // ---------- live panels ----------
 function render() {
   if (!S) return;
-  const [v, u] = bits(S.rx);
+  const [v, u] = bits(S.r1);
   txt($("#spd"), v); txt($("#spdu"), u);
-  txt($("#spdB"), frate(S.rx)); txt($("#nic"), fbits(S.nic));
-  txt($("#r1"), fbits(S.r1)); txt($("#r5"), fbits(S.r5)); txt($("#peak"), fbits(peak));
+  txt($("#spdB"), frate(S.r1)); txt($("#nic"), fbits(S.nic1 !== undefined ? S.nic1 : S.nic));
+  txt($("#r5"), fbits(S.r5)); txt($("#peak"), fbits(peak));
   const nq = S.q[0], nact = S.q[1];
   const state = S.p ? ["paused", "pill warn"] : nact ? ["downloading", "pill ok"] : nq ? ["waiting", "pill acc"] : ["idle", "pill"];
   txt($("#state"), state[0]); cls($("#state"), state[1]);

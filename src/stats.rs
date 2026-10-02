@@ -23,6 +23,37 @@ struct Sample {
     srv: Vec<f32>,
 }
 
+/// Rates over a sliding window of ticks (bytes and seconds summed, so uneven
+/// tick spacing does not distort them).
+struct Window {
+    ticks: VecDeque<(f64, f64, f64, Vec<f64>)>,
+}
+
+impl Window {
+    fn push(&mut self, dt: f64, rx: f64, nic: f64, srv: Vec<f64>) {
+        if self.ticks.len() == 50 {
+            self.ticks.pop_front();
+        }
+        self.ticks.push_back((dt, rx, nic, srv));
+    }
+
+    /// (payload, nic, per server) bytes/s over the last `n` ticks.
+    fn rates(&self, n: usize) -> (f64, f64, Vec<f64>) {
+        let last: Vec<_> = self.ticks.iter().rev().take(n).collect();
+        let t: f64 = last.iter().map(|x| x.0).sum::<f64>().max(1e-3);
+        let k = last.first().map(|x| x.3.len()).unwrap_or(0);
+        let srv = (0..k).map(|i| last.iter().map(|x| x.3[i]).sum::<f64>() / t).collect();
+        (last.iter().map(|x| x.1).sum::<f64>() / t, last.iter().map(|x| x.2).sum::<f64>() / t, srv)
+    }
+}
+
+/// Job list from the last snapshot that could take the store lock.
+#[derive(Default)]
+struct JobCache {
+    jobs: Vec<Value>,
+    q: (usize, usize, u64, usize),
+}
+
 pub struct Hub {
     snap: Mutex<(u64, Arc<str>)>,
     cv: Condvar,
@@ -106,7 +137,8 @@ impl Hub {
         let mut free = (0, 0);
         let mut move_rate = 0.0f64;
         let mut job_rate: HashMap<usize, (u64, f64)> = HashMap::new();
-        let mut rates: VecDeque<f64> = VecDeque::with_capacity(100);
+        let mut win = Window { ticks: VecDeque::with_capacity(50) };
+        let mut cache = JobCache::default();
         loop {
             next += TICK;
             let now = Instant::now();
@@ -120,23 +152,23 @@ impl Hub {
             let dt = now.duration_since(last).as_secs_f64().max(1e-3);
             last = now;
             let mut srv = Vec::with_capacity(n);
+            let mut srv_b = Vec::with_capacity(n);
             let mut total = 0.0;
             for (i, s) in eng.stats.iter().enumerate() {
                 let b = s.bytes.load(Relaxed);
-                let r = (b - prev[i]) as f64 / dt;
+                let d = (b - prev[i]) as f64;
                 prev[i] = b;
-                total += r;
-                srv.push(r);
+                total += d / dt;
+                srv.push(d / dt);
+                srv_b.push(d);
             }
             let nb = read_u64(&nic_path);
-            let nic = nb.saturating_sub(prev_nic) as f64 / dt;
+            let nic_b = nb.saturating_sub(prev_nic) as f64;
+            let nic = nic_b / dt;
             prev_nic = nb;
-            rates.push_back(total);
-            if rates.len() > 100 {
-                rates.pop_front();
-            }
-            let avg = |k: usize| rates.iter().rev().take(k).sum::<f64>() / k.min(rates.len()).max(1) as f64;
-            let (r1, r5) = (avg(10), avg(50));
+            win.push(dt, total * dt, nic_b, srv_b);
+            let (r1, nic1, srv1) = win.rates(10);
+            let (r5, _, _) = win.rates(50);
             eng.rate5.store(r5 as u64, Relaxed);
             {
                 let mut ring = self.ring.lock().unwrap();
@@ -159,7 +191,7 @@ impl Hub {
             if self.clients.load(Relaxed) == 0 {
                 continue;
             }
-            let snap = self.build(&eng, tick, dt, total, nic, r1, r5, &srv, cpu_pct, rss, free, move_rate, &mut job_rate);
+            let snap = self.build(&eng, tick, total, nic, (r1, nic1, r5), &srv, &srv1, cpu_pct, rss, free, move_rate, &mut job_rate, &mut cache, dt);
             let mut s = self.snap.lock().unwrap();
             *s = (tick, Arc::from(snap.as_str()));
             drop(s);
@@ -172,17 +204,18 @@ impl Hub {
         &self,
         eng: &Engine,
         tick: u64,
-        dt: f64,
         rx: f64,
         nic: f64,
-        r1: f64,
-        r5: f64,
+        (r1, nic1, r5): (f64, f64, f64),
         srv: &[f64],
+        srv1: &[f64],
         cpu: f64,
         rss: u64,
         free: (u64, u64),
         move_rate: f64,
         job_rate: &mut HashMap<usize, (u64, f64)>,
+        cache: &mut JobCache,
+        dt: f64,
     ) -> String {
         let servers: Vec<Value> = eng
             .stats
@@ -190,7 +223,7 @@ impl Hub {
             .enumerate()
             .map(|(i, s)| {
                 json!([
-                    srv[i].round(),
+                    srv1.get(i).copied().unwrap_or(srv[i]).round(),
                     s.live.load(Relaxed),
                     eng.servers[i].conns,
                     (eng.q.hit_rate(i) * 1000.0).round() / 10.0,
@@ -202,14 +235,15 @@ impl Hub {
                     eng.q.is_down(i) as u8,
                     s.bytes.load(Relaxed),
                     s.crc_errors.load(Relaxed),
+                    srv[i].round(),
                 ])
             })
             .collect();
-        let mut jobs = vec![];
-        let (mut nq, mut nact, mut left, mut npaused) = (0usize, 0usize, 0u64, 0usize);
-        let mut seen = Vec::new();
-        {
-            let st = eng.store.lock().unwrap();
+        // Telemetry never waits on the store: if an API call holds it, reuse the last list.
+        if let Ok(st) = eng.store.try_lock() {
+            let mut jobs = vec![];
+            let (mut nq, mut nact, mut left, mut npaused) = (0usize, 0usize, 0u64, 0usize);
+            let mut seen = Vec::new();
             for e in &st.queue {
                 nq += 1;
                 let (t, d) = e.progress();
@@ -224,7 +258,7 @@ impl Hub {
                 let ent = job_rate.entry(id).or_insert((d, 0.0));
                 let inst = (d.saturating_sub(ent.0)) as f64 / dt;
                 ent.0 = d;
-                ent.1 = ent.1 * 0.8 + inst * 0.2;
+                ent.1 = ent.1 * 0.9 + inst * 0.1;
                 if jobs.len() < MAX_JOBS {
                     jobs.push(json!([
                         e.m.nzo,
@@ -240,14 +274,19 @@ impl Hub {
                     ]));
                 }
             }
+            drop(st);
+            job_rate.retain(|k, _| seen.contains(k));
+            *cache = JobCache { jobs, q: (nq, nact, left, npaused) };
         }
-        job_rate.retain(|k, _| seen.contains(k));
+        let (nq, nact, left, npaused) = cache.q;
+        let jobs = &cache.jobs;
         let eta = if r5 > 1.0 { (left as f64 / r5) as u64 } else { 0 };
         let snap = json!({
             "t": now_ms(),
             "k": tick,
             "rx": rx.round(),
             "nic": nic.round(),
+            "nic1": nic1.round(),
             "r1": r1.round(),
             "r5": r5.round(),
             "srv": servers,

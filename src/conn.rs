@@ -178,6 +178,9 @@ struct Rd {
     buf: Vec<u8>,
     start: usize,
     end: usize,
+    /// Counts bytes as they arrive, so throughput reflects the wire rather than
+    /// when articles happen to finish.
+    rx: Option<Arc<SStats>>,
 }
 
 fn err(msg: String) -> io::Error {
@@ -198,6 +201,9 @@ impl Rd {
         let n = self.s.read(&mut self.buf[self.end..])?;
         if n == 0 {
             return Err(err("connection closed".into()));
+        }
+        if let Some(st) = &self.rx {
+            st.bytes.fetch_add(n as u64, Relaxed);
         }
         self.end += n;
         Ok(())
@@ -302,7 +308,7 @@ fn note_error(ctx: &ConnCtx, e: &io::Error) {
 /// Connects and logs in without any work, to find out whether a down server is back.
 fn probe(ctx: &ConnCtx) -> io::Result<()> {
     let s = connect(&ctx.cfg, &ctx.tls)?;
-    let mut rd = Rd { s, buf: vec![0; 64 << 10], start: 0, end: 0 };
+    let mut rd = Rd { s, buf: vec![0; 64 << 10], start: 0, end: 0, rx: None };
     login(&mut rd, &ctx.cfg)?;
     let _ = send(&mut rd, "QUIT\r\n");
     Ok(())
@@ -356,7 +362,7 @@ pub fn run(ctx: ConnCtx) {
 
 fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>) -> io::Result<()> {
     let s = connect(&ctx.cfg, &ctx.tls)?;
-    let mut rd = Rd { s, buf: vec![0; 8 << 20], start: 0, end: 0 };
+    let mut rd = Rd { s, buf: vec![0; 8 << 20], start: 0, end: 0, rx: Some(ctx.st.clone()) };
     login(&mut rd, &ctx.cfg)?;
     ctx.st.consec_fail.store(0, Relaxed);
     ctx.st.live.fetch_add(1, Relaxed);
@@ -408,7 +414,6 @@ fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>) -> io::Result<()> {
                 let (s, e) = rd.block(&fin)?;
                 let w = inflight.pop_front().unwrap();
                 sent -= 1;
-                ctx.st.bytes.fetch_add((e - s) as u64, Relaxed);
                 LIMIT.consume((e - s) as u64);
                 ctx.q.record(ctx.idx, true, w.tried != 0);
                 match yenc::decode(&rd.buf[s..e], &mut out) {
@@ -445,7 +450,7 @@ fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>) -> io::Result<()> {
 pub fn fetch_raw(cfg: &ServerCfg, msgid: &str) -> io::Result<Vec<u8>> {
     let tls = tls_config(cfg.insecure);
     let s = connect(cfg, &tls)?;
-    let mut rd = Rd { s, buf: vec![0; 8 << 20], start: 0, end: 0 };
+    let mut rd = Rd { s, buf: vec![0; 8 << 20], start: 0, end: 0, rx: None };
     login(&mut rd, cfg)?;
     send(&mut rd, &format!("BODY {msgid}\r\n"))?;
     let status = rd.line()?;

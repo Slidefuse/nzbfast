@@ -17,9 +17,9 @@ pub const CHUNK: u64 = 8 << 20;
 const ALIGN: usize = 4096;
 
 #[cfg(target_os = "linux")]
-const O_DIRECT: i32 = libc::O_DIRECT;
+pub const O_DIRECT: i32 = libc::O_DIRECT;
 #[cfg(not(target_os = "linux"))]
-const O_DIRECT: i32 = 0;
+pub const O_DIRECT: i32 = 0;
 
 /// Reserves the file's blocks up front (falls back to a sparse resize).
 fn preallocate(file: &File, size: u64) -> std::io::Result<()> {
