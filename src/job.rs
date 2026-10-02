@@ -87,6 +87,8 @@ struct Plan {
     ids: Vec<FileId>,
     par2_outs: Vec<usize>,
     raw_rar: Vec<usize>,
+    /// 7z archives (single files or `.7z.NNN` volumes), unpacked after the download.
+    sevenz: Vec<usize>,
 }
 
 #[derive(Default)]
@@ -210,6 +212,61 @@ fn is_obfuscated(name: &str) -> bool {
 fn non_essential(name: &str) -> bool {
     let l = name.to_ascii_lowercase();
     [".par2", ".nfo", ".sfv", ".srr", ".srs", ".nzb", ".jpg", ".png", ".txt", ".url", ".md5"].iter().any(|e| l.ends_with(e))
+}
+
+const SIG_7Z: &[u8] = &[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c];
+
+/// `x.7z` or a split volume `x.7z.001`.
+fn looks_like_7z(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    l.ends_with(".7z") || sevenz_volume(&l).is_some()
+}
+
+/// Volume number of `x.7z.NNN` (1-based) and the archive name `x.7z`.
+fn sevenz_volume(name: &str) -> Option<(u32, String)> {
+    let (stem, ext) = name.rsplit_once('.')?;
+    if ext.len() == 3 && ext.bytes().all(|c| c.is_ascii_digit()) && stem.to_ascii_lowercase().ends_with(".7z") {
+        return Some((ext.parse().ok()?, stem.to_ascii_lowercase()));
+    }
+    None
+}
+
+/// Read + Seek over several files back to back (split 7z volumes).
+struct Chain {
+    parts: Vec<(File, u64)>,
+    total: u64,
+    pos: u64,
+}
+
+impl Read for Chain {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut base = 0;
+        for (f, len) in &self.parts {
+            if self.pos < base + len {
+                let n = ((base + len - self.pos) as usize).min(buf.len());
+                let got = f.read_at(&mut buf[..n], self.pos - base)?;
+                self.pos += got as u64;
+                return Ok(got);
+            }
+            base += len;
+        }
+        Ok(0)
+    }
+}
+
+impl Seek for Chain {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        let p = match to {
+            SeekFrom::Start(p) => p as i64,
+            SeekFrom::End(d) => self.total as i64 + d,
+            SeekFrom::Current(d) => self.pos as i64 + d,
+        };
+        if p < 0 {
+            return Err(std::io::Error::other("seek before start"));
+        }
+        self.pos = p as u64;
+        Ok(self.pos)
+    }
 }
 
 fn looks_like_rar(name: &str) -> bool {
@@ -524,6 +581,7 @@ impl Job {
         let mut main = vec![];
         let mut par2_outs = vec![];
         let mut raw_rar = vec![];
+        let mut sevenz = vec![];
         let mut ids = vec![FileId::default(); self.files.len()];
         let job_name = self.name.clone();
         let deobf = |name: &str| -> String {
@@ -558,11 +616,19 @@ impl Job {
             }
             let Some(p) = &probes[i] else {
                 notes.push(format!("first article missing for {}", f.guess));
-                let dir = if looks_like_rar(&f.guess) { aux.join("rar") } else { aux.clone() };
+                let dir = if looks_like_rar(&f.guess) {
+                    aux.join("rar")
+                } else if looks_like_7z(&f.guess) {
+                    aux.join("7z")
+                } else {
+                    aux.clone()
+                };
                 let t = make(&dir, &f.guess, 0, &mut outs, &mut paths);
                 if let Target::Plain { out } = t {
                     if looks_like_rar(&f.guess) {
                         raw_rar.push(out);
+                    } else if looks_like_7z(&f.guess) {
+                        sevenz.push(out);
                     }
                 }
                 ids[i] = FileId { yname: f.guess.clone(), size: 0, md5_16k: None };
@@ -588,6 +654,12 @@ impl Job {
                 let t = make(&aux.join("rar"), &name, p.info.size, &mut outs, &mut paths);
                 if let Target::Plain { out } = t {
                     raw_rar.push(out);
+                }
+                targets.push(t);
+            } else if p.data.starts_with(SIG_7Z) || looks_like_7z(&name) {
+                let t = make(&aux.join("7z"), &name, p.info.size, &mut outs, &mut paths);
+                if let Target::Plain { out } = t {
+                    sevenz.push(out);
                 }
                 targets.push(t);
             } else if p.data.starts_with(b"PAR2\0PKT") {
@@ -677,7 +749,7 @@ impl Job {
             }
             sets.push(RarSet { name: out_name, out, vols: vidx, unp_size: g[0].1.unp_size });
         }
-        Plan { targets, outs, paths, vols, sets, notes, main, ids, par2_outs, raw_rar }
+        Plan { targets, outs, paths, vols, sets, notes, main, ids, par2_outs, raw_rar, sevenz }
     }
 
     // ---------- verification ----------
@@ -959,6 +1031,107 @@ impl Job {
             }
         }
         Ok(msgs)
+    }
+
+    /// Unpacks 7z archives (split `.7z.NNN` volumes are read back to back).
+    fn extract_7z(&self, plan: &Plan) -> (Vec<String>, bool) {
+        let mut sets: std::collections::BTreeMap<String, Vec<(u32, PathBuf)>> = Default::default();
+        for &o in &plan.sevenz {
+            let p = plan.paths[o].clone();
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            match sevenz_volume(&name) {
+                Some((n, base)) => sets.entry(base).or_default().push((n, p)),
+                None => sets.entry(name.to_ascii_lowercase()).or_default().push((1, p)),
+            }
+        }
+        let mut res = vec![];
+        let mut ok = true;
+        for (base, mut vols) in sets {
+            vols.sort_by_key(|v| v.0);
+            match self.unpack_7z(&vols) {
+                Ok((n, bytes)) => {
+                    res.push(format!("unpacked {n} file(s), {:.2} GB from 7z ({base}, {} volume(s))", bytes as f64 / 1e9, vols.len()));
+                    for (_, p) in &vols {
+                        let _ = fs::remove_file(p);
+                    }
+                }
+                Err(e) => {
+                    res.insert(0, format!("Unpacking failed: {base}: {e}"));
+                    ok = false;
+                }
+            }
+        }
+        (res, ok)
+    }
+
+    fn unpack_7z(&self, vols: &[(u32, PathBuf)]) -> Result<(usize, u64), String> {
+        if vols.iter().enumerate().any(|(i, v)| v.0 as usize != i + 1) {
+            return Err(format!("missing volumes (have {:?})", vols.iter().map(|v| v.0).collect::<Vec<_>>()));
+        }
+        let mut parts = vec![];
+        let mut total = 0;
+        for (_, p) in vols {
+            let f = File::open(p).map_err(|e| e.to_string())?;
+            let len = f.metadata().map_err(|e| e.to_string())?.len();
+            total += len;
+            parts.push((f, len));
+        }
+        let pw = match &self.password {
+            Some(p) => sevenz_rust2::Password::from(p.as_str()),
+            None => sevenz_rust2::Password::empty(),
+        };
+        let mut ar = sevenz_rust2::ArchiveReader::new(Chain { parts, total, pos: 0 }, pw).map_err(|e| e.to_string())?;
+        let (mut n, mut bytes) = (0usize, 0u64);
+        let mut err: Option<String> = None;
+        let mut buf = vec![0u8; 4 << 20];
+        let r = ar.for_each_entries(|entry, reader| {
+            // Entry names come from the archive: never let them escape the job folder.
+            let rel = sanitize(&entry.name().replace('\\', "/"));
+            if entry.is_directory() {
+                let _ = fs::create_dir_all(self.work.join(&rel));
+                return Ok(true);
+            }
+            let rel = match rel.file_name() {
+                Some(f) => rel.with_file_name(self.output_name(&f.to_string_lossy())),
+                None => rel,
+            };
+            let dest = self.work.join(&rel);
+            if let Some(parent) = dest.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let w = (|| -> std::io::Result<u64> {
+                let mut out = File::create(&dest)?;
+                let mut written = 0u64;
+                loop {
+                    let k = reader.read(&mut buf)?;
+                    if k == 0 {
+                        break;
+                    }
+                    out.write_all(&buf[..k])?;
+                    written += k as u64;
+                }
+                Ok(written)
+            })();
+            match w {
+                Ok(b) => {
+                    n += 1;
+                    bytes += b;
+                    Ok(true)
+                }
+                Err(e) => {
+                    err = Some(format!("{}: {e}", rel.display()));
+                    Ok(false)
+                }
+            }
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+        r.map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("archive contains no files".into());
+        }
+        Ok((n, bytes))
     }
 
     fn rar4_volnum(p: &Path) -> Option<u64> {
@@ -1393,13 +1566,18 @@ impl Job {
         }
         let (raw, raw_ok) = self.extract_raw(plan);
         parts.extend(raw);
+        if !plan.sevenz.is_empty() {
+            self.phase.store(PH_EXTRACT, Relaxed);
+        }
+        let (z, z_ok) = self.extract_7z(plan);
+        parts.extend(z);
         parts.extend(plan.main.iter().cloned());
         parts.extend(notes);
         let write_errors: usize = plan.outs.iter().map(|o| o.write_errors.load(Relaxed)).sum();
         if write_errors > 0 {
             parts.push(format!("{write_errors} write errors"));
         }
-        let ok = sets_ok && raw_ok && write_errors == 0;
+        let ok = sets_ok && raw_ok && z_ok && write_errors == 0;
         if ok {
             let _ = fs::remove_dir_all(self.work.join(".aux"));
             if let Some(done) = &self.done_dir {

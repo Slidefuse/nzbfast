@@ -7,7 +7,8 @@ large Plex libraries fed by Sonarr/Radarr.
 - Stored RAR sets are written straight into the extracted file while downloading
   (no volumes on disk); RAR CRCs are verified from the per-article CRCs.
 - Compressed, encrypted, obfuscated and multi-file RAR sets are unpacked in-process
-  with the UnRAR library (statically linked; no external binaries).
+  with the UnRAR library (statically linked), and 7z archives (single or split
+  `.7z.NNN`, optionally encrypted) with a pure-Rust decoder. No external binaries.
 - par2 verification and Reed–Solomon repair in-process, fetching only the recovery
   volumes a repair needs.
 - Adaptive routing across providers; unreachable providers are detected and routed
@@ -41,6 +42,11 @@ Supported modes: `version`, `auth`, `get_config`, `fullstatus`, `status`,
 
 Tested end to end with Sonarr 4.0.20 and Radarr 6.4.4: client test, grab,
 download, import, failed-download blocklisting, and removal after import.
+
+To take over a running SABnzbd without losing track of downloads, pause SABnzbd,
+stop nzbfast and run `nzbfast import-sab --sab-url URL --sab-incomplete DIR`: the
+queue (with SABnzbd's job ids, order, priorities and passwords) and history move
+over, so Sonarr/Radarr keep tracking everything once their client points here.
 
 Archive passwords are taken from `<meta type="password">` in the NZB or from
 a `Name{{password}}` job name.
