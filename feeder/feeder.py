@@ -280,6 +280,72 @@ SE = re.compile(r"\bS(\d{1,2})[ ._-]?E(\d{1,3})(?:[ ._-]?E?(\d{1,3}))?\b", re.I)
 SPACK = re.compile(r"\b(?:S(\d{1,2})(?![ ._-]?E\d)(?![ ._-]?-?[ ._-]?S\d)|Season[ ._-]?(\d{1,2}))\b", re.I)
 
 
+def _alnum(t):
+    return re.sub(r"[^a-z0-9]+", "", t.lower())
+
+
+def match_episode(fname, season_eps):
+    """Episode id for a pack file from its name: SxxEyy / 1x05 / E05 / a leading number
+    ("28.Vendetta.mkv") / the episode title. None when unsure."""
+    stem = os.path.splitext(fname)[0]
+    by_num = {n: i for n, _, i in season_eps}
+    for rx in (r"\bS\d{1,2}[ ._-]?E(\d{1,3})\b", r"\b\d{1,2}x(\d{2,3})\b", r"\bE(?:p(?:isode)?)?[ ._-]?(\d{1,3})\b",
+               r"^(\d{1,3})(?=[ ._-]|$)"):
+        m = re.search(rx, stem, re.I)
+        if m and int(m.group(1)) in by_num:
+            return by_num[int(m.group(1))]
+    s = _alnum(stem)
+    hit = [i for _, t, i in season_eps if len(_alnum(t)) >= 4 and _alnum(t) in s]
+    return hit[0] if len(hit) == 1 else None
+
+
+def mkv_title(path):
+    """Segment title (Info/Title) of a Matroska file, or None."""
+    try:
+        with open(path, "rb") as f:
+            d = f.read(1 << 20)
+    except OSError:
+        return None
+
+    def vint(i, keep_marker):
+        if i >= len(d) or d[i] == 0:
+            return None, i
+        n = 8 - d[i].bit_length() + 1
+        v = d[i] if keep_marker else d[i] & ((1 << (8 - n)) - 1)
+        for b in d[i + 1:i + n]:
+            v = v << 8 | b
+        return v, i + n
+    eid, i = vint(0, True)
+    if eid != 0x1A45DFA3:
+        return None
+    n, i = vint(i, False)
+    i += n or 0
+    eid, i = vint(i, True)
+    if eid != 0x18538067:
+        return None
+    _, i = vint(i, False)
+    while i < len(d):
+        eid, i = vint(i, True)
+        n, i = vint(i, False)
+        if eid is None or n is None:
+            return None
+        if eid == 0x1549A966:
+            end = min(i + n, len(d))
+            while i < end:
+                cid, i = vint(i, True)
+                cn, i = vint(i, False)
+                if cid is None or cn is None:
+                    return None
+                if cid == 0x7BA9:
+                    return d[i:i + cn].decode("utf-8", "replace").strip() or None
+                i += cn
+            return None
+        if eid == 0x1F43B675:
+            return None
+        i += n
+    return None
+
+
 def rejection_text(r):
     return r.get("reason", str(r)) if isinstance(r, dict) else str(r)
 
@@ -499,28 +565,36 @@ class Feeder:
             STOP.wait(600)
 
     # -- searching
-    def search_all(self, params):
+    def search_all(self, params, cover=None):
+        """Hits from every indexer. `cover` (a list) gets False appended when one of them
+        was unavailable or failed, so "no hits" is not trusted for long."""
         hits = []
         for ix in self.indexers:
+            if not ix.available():
+                if cover is not None:
+                    cover.append(False)
+                continue
             try:
                 hits += ix.search(params)
             except IndexerError as e:
                 log.debug("search error %s", e)
+                if cover is not None:
+                    cover.append(False)
         return hits
 
-    def search_item(self, item):
+    def search_item(self, item, cover=None):
         if item["key"].startswith("m:"):
             p = {"t": "movie", "cat": "2000"}
             if item["imdb"]:
                 p["imdbid"] = item["imdb"].removeprefix("tt")
             else:
                 p["tmdbid"] = item["tmdb"]
-            return self.search_all(p)
+            return self.search_all(p, cover)
         p = {"t": "tvsearch", "cat": "5000", "tvdbid": item["tvdb"], "season": item["season"]}
-        hits = self.search_all(p)
+        hits = self.search_all(p, cover)
         # big seasons: fetch a second page so packs are not crowded out by episodes
         if len(hits) >= 100 * len(self.indexers) * 0.9:
-            hits += self.search_all(dict(p, offset=100))
+            hits += self.search_all(dict(p, offset=100), cover)
         return hits
 
     # -- validation through the app's own parser
@@ -644,7 +718,7 @@ class Feeder:
         cands = [(s, h) for s, h in cands if s]
         if not cands:
             self.stats["nohits"] += 1
-            return self.mark(item["key"], f"nohits:{len(hits)}", 86400)
+            return self.mark(item["key"], f"nohits:{len(hits)}", item.get("retry_s", 86400))
         if item["upgrade"]:
             extra = {"movieId": item["id"], "tmdbId": item["tmdb"] or 0}
             if item["imdb"] and item["imdb"][2:].isdigit():
@@ -658,7 +732,7 @@ class Feeder:
             return self.mark(item["key"], "upgrade-rejected", 86400)
         if self.pick_and_grab("radarr", item, cands, lambda h: item["runtime"]):
             return self.mark(item["key"], "grabbed", 12 * 3600)
-        self.mark(item["key"], "rejected", 86400)
+        self.mark(item["key"], "rejected", item.get("retry_s", 86400))
 
     def handle_season(self, item, hits):
         rules = self.rules["sonarr"]
@@ -693,7 +767,7 @@ class Feeder:
         if not eps:
             if not packs:
                 self.stats["nohits"] += 1
-            return self.mark(item["key"], f"nohits:{len(hits)}" if not packs else "rejected", 86400)
+            return self.mark(item["key"], f"nohits:{len(hits)}" if not packs else "rejected", item.get("retry_s", 86400))
         got, covered = 0, set()
         for e, cands in sorted(eps.items()):
             if e in covered:
@@ -705,7 +779,7 @@ class Feeder:
         if got:
             # the rest (episodes without hits / rejected) is retried on a later pass
             return self.mark(item["key"], f"grabbed-eps:{got}", 12 * 3600)
-        self.mark(item["key"], "rejected-eps", 86400)
+        self.mark(item["key"], "rejected-eps", item.get("retry_s", 86400))
 
     # -- completion: import or retry
     def importer(self):
@@ -720,6 +794,9 @@ class Feeder:
                                           "where status in ('queued','importing')")}
         if not active:
             return
+        # jobs queued by another process (--reimport-rejected) are in flight too
+        for _, _, app, _, target, _, _ in active.values():
+            self.busy[app].update(self.target_ids(app, json.loads(target or "{}")))
         hist = {}
         for cat in set(self.cats.values()):
             for s in self.sab(mode="history", cat=cat, limit=2000)["history"]["slots"]:
@@ -758,8 +835,14 @@ class Feeder:
         root = storage.rstrip("/") + "/"
         videos = [p for p in prev if p.get("path", "").startswith(root) and p["path"].lower().endswith(VIDEO)]
         files, reasons = [], []
+        season_eps = None
+        if arr.name == "sonarr" and len(videos) > 1:
+            season_eps = self.season_episodes(arr, target)
         for p in videos:
             rej = [rejection_text(r) for r in p.get("rejections") or []]
+            # samples are small; the app cannot always tell from a full-size file
+            if (p.get("size") or 0) >= 100 * 2**20:
+                rej = [r for r in rej if not re.search(r"unable to determine if file is a sample", r, re.I)]
             f = {"path": p["path"], "quality": p.get("quality"), "languages": p.get("languages") or [],
                  "releaseGroup": p.get("releaseGroup") or "", "indexerFlags": p.get("indexerFlags") or 0,
                  "downloadId": nzo}
@@ -770,6 +853,16 @@ class Feeder:
                 if not epids and len(videos) == 1:
                     epids = target["episodeIds"]  # obfuscated single file: we know what it is
                     rej = [r for r in rej if not re.search(r"unknown|unable to (identify|parse)", r, re.I)]
+                elif season_eps and (not epids or len(epids) > 3):
+                    # pack files named without SxxEyy ("28.Vendetta.mkv"): the app reads the
+                    # folder name and assigns the whole season to each file
+                    e = match_episode(os.path.basename(p["path"]), season_eps)
+                    if not e and p["path"].lower().endswith(".mkv"):
+                        t = mkv_title(p["path"])  # obfuscated packs often keep the name here
+                        e = match_episode(t, season_eps) if t else None
+                    if e:
+                        epids = [e]
+                        rej = [r for r in rej if not re.search(r"all episodes in season|unknown|unable to (identify|parse)", r, re.I)]
                 if not epids:
                     reasons.append(f"{os.path.basename(p['path'])}: no episode match")
                     continue
@@ -790,10 +883,66 @@ class Feeder:
             self.unbusy(nzo)
             self.q("update jobs set status='import-rejected', t_done=?, note=? where nzo=?",
                    (time.time(), reason, nzo), commit=True)
+            # never grab this release again (it was re-grabbed up to 16 times); the item
+            # is searched again for another one
+            self.q("insert or replace into failed values(?,?,?)", (title.lower(), time.time(), "import: " + reason[:290]))
+            self.q("update items set next_due=0 where key=?", (key,), commit=True)
+            for b in self.blocklists.values():
+                b.add(title.lower())
             return
         cmd = arr.req("POST", "/command", {"name": "ManualImport", "files": files, "importMode": "move"})
         self.q("update jobs set status='importing', cmd=?, note=? where nzo=?",
                (cmd["id"], "; ".join(reasons)[:300] or None, nzo), commit=True)
+
+    def reimport_rejected(self, tidy_bin):
+        """One-off: downloads rejected at import (still on disk) are tidied by nzbfast
+        (split files, missing extensions, nested archives) and queued for import again."""
+        import subprocess
+        store = {}
+        for cat in set(self.cats.values()):
+            for h in self.sab(mode="history", cat=cat, limit=20000)["history"]["slots"]:
+                if h["status"] == "Completed" and h.get("storage"):
+                    store[h["nzo_id"]] = h["storage"]
+        rows = self.q("select nzo, title from jobs where status in ('import-rejected','import-failed') order by t_added desc")
+        n = gone = dupes = 0
+        seen = set()
+        for nzo, title in rows:
+            path = store.get(nzo)
+            if not path or not os.path.isdir(path):
+                gone += 1
+                continue
+            if title.lower() in seen:
+                # an older copy of a release grabbed again later: drop it
+                dupes += 1
+                self.q("update jobs set status='superseded' where nzo=?", (nzo,), commit=True)
+                try:
+                    self.sab(mode="history", name="delete", value=nzo, del_files=1)
+                except Exception as e:
+                    log.warning("delete %s: %s", nzo, e)
+                continue
+            seen.add(title.lower())
+            # undo the blocklisting: this copy gets another import attempt
+            self.q("delete from failed where title=? and reason like 'import:%'", (title.lower(),), commit=True)
+            try:
+                out = subprocess.run([tidy_bin, "tidy", "--name", title, path], capture_output=True, text=True, timeout=3600).stdout.strip()
+                if out:
+                    log.info("TIDY %s: %s", title, out.replace("\n", "; ")[:200])
+            except Exception as e:
+                log.warning("tidy %s: %s", title, e)
+            self.q("update jobs set status='queued', note=null, cmd=null where nzo=?", (nzo,), commit=True)
+            n += 1
+        log.info("re-queued %d rejected downloads for import (%d older duplicates deleted, %d no longer on disk)", n, dupes, gone)
+
+    def season_episodes(self, arr, target):
+        """[(number, title, id)] of the target season, for matching pack files."""
+        ids = set(target.get("episodeIds") or [])
+        try:
+            eps = arr.req("GET", f"/episode?seriesId={target['seriesId']}")
+        except Exception as e:
+            log.debug("episodes %s: %s", target, e)
+            return None
+        seasons = {e["seasonNumber"] for e in eps if e["id"] in ids}
+        return [(e["episodeNumber"], e.get("title") or "", e["id"]) for e in eps if e["seasonNumber"] in seasons]
 
     def not_imported(self, arr, target):
         """Ids of the target's episodes/movie that still have no file."""
@@ -944,7 +1093,10 @@ class Feeder:
         if STOP.is_set():
             return
         try:
-            hits = self.search_item(item)
+            cover = []
+            hits = self.search_item(item, cover)
+            # not every indexer answered (daily limits): look again in hours, not a day
+            item["retry_s"] = 86400 if all(cover) else 3 * 3600
             self.stats["searched"] += 1
             (self.handle_movie if item["key"].startswith("m:") else self.handle_season)(item, hits)
         except QueueFull:
@@ -1023,6 +1175,7 @@ def main():
     ap.add_argument("--once", action="store_true", help="one pass over due items, then exit")
     ap.add_argument("--limit", type=int, default=0, help="only process the first N due items (testing)")
     ap.add_argument("--import-only", action="store_true", help="only run import passes (testing)")
+    ap.add_argument("--reimport-rejected", metavar="NZBFAST_BIN", help="tidy and re-queue import-rejected downloads, then exit")
     ap.add_argument("-v", action="store_true")
     a = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if a.v else logging.INFO,
@@ -1034,6 +1187,9 @@ def main():
     logging.getLogger().addHandler(ring)
     signal.signal(signal.SIGTERM, lambda *_: STOP.set())
     signal.signal(signal.SIGINT, lambda *_: STOP.set())
+    if a.reimport_rejected:
+        f.reimport_rejected(a.reimport_rejected)
+        return
     if a.import_only:
         f.refresh_wanted()
         f.importer()

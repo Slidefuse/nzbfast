@@ -16,6 +16,7 @@ mod stats;
 mod svccfg;
 mod yenc;
 mod ysimd;
+mod zip;
 
 use conn::{ConnCtx, SStats};
 use job::{Job, JobResult};
@@ -32,6 +33,7 @@ fn usage() -> ! {
   nzbfast import-sab [--config FILE] --sab-url URL --sab-incomplete DIR [--dry-run]
   nzbfast get [--sab-ini FILE] [--server SPEC]... [--only a,b] [--tmp DIR] [--done DIR]
               [--active N] [--depth N] [--nic IF] [--limit N] NZB|DIR...
+  nzbfast tidy [--name NAME] [--password PW] DIR   (join splits, name by content, unpack nested)
   nzbfast mock-gen --out DIR RELEASE_DIR...
   nzbfast mock-serve --dir DIR [--port P] [--tls] [--drop SUBSTR:EVERY[:CODE]]... [--miss-ms N] [--conn-mbs N]
   nzbfast bench"
@@ -119,6 +121,22 @@ fn main() {
                 }
             }
             mock::serve(Path::new(&dir.unwrap_or_else(|| usage())), port, tls, &drops, miss_ms, conn_mbs).unwrap();
+        }
+        "tidy" => {
+            let (mut name, mut pw, mut dir) = (None, None, None);
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--name" => name = it.next().cloned(),
+                    "--password" => pw = it.next().cloned(),
+                    _ => dir = Some(a.clone()),
+                }
+            }
+            let dir = PathBuf::from(dir.unwrap_or_else(|| usage()));
+            let name = name.unwrap_or_else(|| dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+            for m in job::Job::tidy_dir(&dir, &name, pw) {
+                println!("{m}");
+            }
         }
         "bench" => bench(),
         "fetch" => {

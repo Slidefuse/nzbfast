@@ -21,6 +21,7 @@ use crate::par2::{self, Par2Set};
 use crate::queue::{JobRoute, Queues, Work};
 use crate::rar::{self, RarVol};
 use crate::yenc::YInfo;
+use crate::zip;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -245,6 +246,80 @@ fn video_magic(d: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// Segment title (`Segment/Info/Title`) from the first bytes of a Matroska file.
+fn mkv_title(d: &[u8]) -> Option<String> {
+    fn id(d: &[u8], i: &mut usize) -> Option<u32> {
+        let b = *d.get(*i)?;
+        let l = b.leading_zeros() as usize + 1;
+        if l > 4 || *i + l > d.len() {
+            return None;
+        }
+        let v = d[*i..*i + l].iter().fold(0u32, |a, &x| a << 8 | x as u32);
+        *i += l;
+        Some(v)
+    }
+    fn size(d: &[u8], i: &mut usize) -> Option<u64> {
+        let b = *d.get(*i)?;
+        let l = b.leading_zeros() as usize + 1;
+        if l > 8 || *i + l > d.len() {
+            return None;
+        }
+        let mut v = (b as u64) & ((1u64 << (8 - l)) - 1);
+        for &x in &d[*i + 1..*i + l] {
+            v = v << 8 | x as u64;
+        }
+        *i += l;
+        // All value bits set: unknown size.
+        Some(if v == (1u64 << (7 * l)) - 1 { u64::MAX } else { v })
+    }
+    let mut i = 0;
+    if id(d, &mut i)? != 0x1A45_DFA3 {
+        return None;
+    }
+    let header = size(d, &mut i)? as usize;
+    i = i.checked_add(header)?;
+    if id(d, &mut i)? != 0x1853_8067 {
+        return None;
+    }
+    size(d, &mut i)?;
+    while i < d.len() {
+        let (eid, len) = (id(d, &mut i)?, size(d, &mut i)?);
+        if eid == 0x1549_A966 {
+            let end = i.checked_add(len as usize)?.min(d.len());
+            while i < end {
+                let (cid, clen) = (id(d, &mut i)?, size(d, &mut i)? as usize);
+                if cid == 0x7BA9 {
+                    let t = String::from_utf8_lossy(d.get(i..i.checked_add(clen)?)?).trim().to_string();
+                    return (!t.is_empty()).then_some(t);
+                }
+                i = i.checked_add(clen)?;
+            }
+            return None;
+        }
+        if eid == 0x1F43_B675 || len == u64::MAX {
+            return None;
+        }
+        i = i.checked_add(len as usize)?;
+    }
+    None
+}
+
+/// An MKV title usable as the file name: a release name with SxxEyy (packs of
+/// obfuscated episodes otherwise cannot be told apart).
+fn episode_title(d: &[u8]) -> Option<String> {
+    let t = mkv_title(d)?;
+    let l = t.to_ascii_lowercase();
+    let b = l.as_bytes();
+    let has_se = (0..b.len()).any(|k| {
+        b[k] == b's' && (k == 0 || !b[k - 1].is_ascii_alphanumeric()) && {
+            let n = b[k + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
+            (1..=2).contains(&n) && b.get(k + 1 + n) == Some(&b'e') && b.get(k + 2 + n).is_some_and(|c| c.is_ascii_digit())
+        }
+    });
+    let name: String = t.chars().map(|c| if c.is_control() || "/\\:*?\"<>|".contains(c) { '_' } else { c }).collect();
+    (has_se && name.len() <= 200).then_some(name)
+}
+
 /// Random-looking names (hashes, base62 blobs) carry no information for Plex/*arr.
 fn is_obfuscated(name: &str) -> bool {
     let stem = name.rsplit('/').next().unwrap_or(name);
@@ -426,6 +501,13 @@ impl Job {
             started: Instant::now(),
             finished,
         })
+    }
+
+    /// Tidies an already finished download folder (`nzbfast tidy`).
+    pub fn tidy_dir(dir: &Path, name: &str, password: Option<String>) -> Vec<String> {
+        let nzb = Nzb { name: name.to_string(), files: vec![], password };
+        let job = Job::new(0, nzb, dir.to_path_buf(), None, Arc::new(|_: &Job, _| {}));
+        job.tidy_output()
     }
 
     /// Queues work for this job, or holds it back while the job is paused.
@@ -795,14 +877,21 @@ impl Job {
         // like `x.mkv.001`, whose first part also starts with a video header).
         let deobf = |name: &str, data: &[u8]| -> String {
             if is_video(name) {
-                return if is_obfuscated(name) { format!("{job_name}.{}", name.rsplit('.').next().unwrap_or("mkv")) } else { name.to_string() };
+                if !is_obfuscated(name) {
+                    return name.to_string();
+                }
+                let ext = name.rsplit('.').next().unwrap_or("mkv");
+                return match episode_title(data) {
+                    Some(t) => format!("{t}.{ext}"),
+                    None => format!("{job_name}.{ext}"),
+                };
             }
             let ext = name.rsplit_once('.').map(|(_, e)| e);
             if ext.is_some_and(|e| e.bytes().all(|c| c.is_ascii_digit())) {
                 return name.to_string();
             }
             match video_magic(data) {
-                Some(v) if is_obfuscated(name) => format!("{job_name}.{v}"),
+                Some(v) if is_obfuscated(name) => format!("{}.{v}", episode_title(data).unwrap_or_else(|| job_name.clone())),
                 Some(v) => format!("{name}.{v}"),
                 None => name.to_string(),
             }
@@ -1495,6 +1584,251 @@ impl Job {
         Ok((n, bytes))
     }
 
+    // ---------- output tidy-up ----------
+
+    /// Files in the job folder (not `.aux`), recursively.
+    fn output_files(&self) -> Vec<PathBuf> {
+        let mut out = vec![];
+        let mut dirs = vec![self.work.clone()];
+        while let Some(d) = dirs.pop() {
+            for e in fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = e.path();
+                match e.file_type() {
+                    Ok(t) if t.is_dir() && e.file_name() != ".aux" => dirs.push(p),
+                    Ok(t) if t.is_file() => out.push(p),
+                    _ => {}
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Fixes what the unpackers leave behind that Radarr/Sonarr reject as "no video
+    /// files": raw split files (`x.mkv.001`…), files whose names lost their extension,
+    /// and archives inside the archive (unpacked only while there is no video yet, so
+    /// bundled extras are left alone).
+    pub fn tidy_output(&self) -> Vec<String> {
+        let mut msgs = vec![];
+        for _ in 0..3 {
+            let n = self.join_splits();
+            if n > 0 {
+                msgs.push(format!("joined {n} split file(s)"));
+            }
+            let n = self.name_by_magic() + self.name_episodes();
+            if n > 0 {
+                msgs.push(format!("{n} file(s) named by content"));
+            }
+            if self.output_files().iter().any(|p| is_video(&p.to_string_lossy())) {
+                break;
+            }
+            let (m, n) = self.extract_nested();
+            msgs.extend(m);
+            if n == 0 {
+                break;
+            }
+        }
+        msgs
+    }
+
+    /// Joins `x.NNN` pieces (consecutive numbers from 000 or 001) into `x`.
+    fn join_splits(&self) -> usize {
+        let mut groups: std::collections::BTreeMap<PathBuf, Vec<(u32, PathBuf)>> = Default::default();
+        for p in self.output_files() {
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let Some((base, ext)) = name.rsplit_once('.') else { continue };
+            if ext.len() != 3 || !ext.bytes().all(|c| c.is_ascii_digit()) || !base.contains('.') {
+                continue;
+            }
+            groups.entry(p.with_file_name(base)).or_default().push((ext.parse().unwrap(), p.clone()));
+        }
+        let mut joined = 0;
+        for (dest, mut g) in groups {
+            g.sort();
+            let first = g[0].0;
+            if g.len() < 2 || first > 1 || g.iter().enumerate().any(|(i, x)| x.0 != first + i as u32) || dest.exists() {
+                continue;
+            }
+            let r = (|| -> std::io::Result<()> {
+                fs::rename(&g[0].1, &dest)?;
+                let mut out = OpenOptions::new().append(true).open(&dest)?;
+                for (_, p) in &g[1..] {
+                    std::io::copy(&mut File::open(p)?, &mut out)?;
+                    fs::remove_file(p)?;
+                }
+                Ok(())
+            })();
+            if r.is_ok() {
+                joined += 1;
+            }
+        }
+        joined
+    }
+
+    /// Gives files without a usable extension one from their first bytes (video gets
+    /// the job name when its own name is obfuscated).
+    fn name_by_magic(&self) -> usize {
+        const KNOWN: &[&str] = &[
+            "mkv", "mp4", "avi", "m4v", "ts", "m2ts", "wmv", "mov", "mpg", "mpeg", "webm", "flv", "vob", "iso", "img", "ogm", "divx",
+            "3gp", "rmvb", "rm", "rar", "zip", "7z", "par2", "nfo", "sfv", "srr", "srs", "nzb", "jpg", "jpeg", "png", "gif", "txt",
+            "url", "md5", "srt", "sub", "idx", "ass", "ssa", "vtt", "sup", "exe", "pdf", "mp3", "flac", "m4a", "ac3", "dts", "aac",
+            "epub", "html", "htm", "db", "xml", "json",
+        ];
+        let mut n = 0;
+        for p in self.output_files() {
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+            if KNOWN.contains(&ext.as_str()) || (ext.len() == 3 && ext.bytes().all(|c| c.is_ascii_digit())) || (!ext.is_empty() && ext.len() <= 4 && ext.starts_with('r') && ext[1..].bytes().all(|c| c.is_ascii_digit())) {
+                continue;
+            }
+            let Ok(f) = File::open(&p) else { continue };
+            if f.metadata().map(|m| m.len()).unwrap_or(0) < 1 << 20 {
+                continue;
+            }
+            let mut head = [0u8; 512];
+            read_fill(&f, &mut head, 0);
+            let new = if let Some(v) = video_magic(&head) {
+                self.output_name(&format!("{name}.{v}"))
+            } else if head.starts_with(b"Rar!\x1a\x07") {
+                format!("{name}.rar")
+            } else if head.starts_with(&[0x50, 0x4b, 0x03, 0x04]) {
+                format!("{name}.zip")
+            } else if head.starts_with(SIG_7Z) {
+                format!("{name}.7z")
+            } else {
+                continue;
+            };
+            let mut dest = p.with_file_name(&new);
+            let mut k = 1;
+            while dest.exists() {
+                let (stem, e) = new.rsplit_once('.').unwrap_or((&new, ""));
+                dest = p.with_file_name(format!("{stem}.{k}.{e}"));
+                k += 1;
+            }
+            if fs::rename(&p, &dest).is_ok() {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Videos named after the job (`job.mkv`, `job.2.mkv`… from obfuscated packs) or
+    /// still obfuscated get the SxxEyy release name stored in their MKV title.
+    fn name_episodes(&self) -> usize {
+        let job = self.name.to_ascii_lowercase();
+        let mut n = 0;
+        for p in self.output_files() {
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let Some((stem, ext)) = name.rsplit_once('.') else { continue };
+            if !is_video(&name) {
+                continue;
+            }
+            let l = stem.to_ascii_lowercase();
+            let numbered = l.strip_prefix(&job).is_some_and(|r| r.is_empty() || (r.len() > 1 && r.starts_with('.') && r[1..].bytes().all(|c| c.is_ascii_digit())));
+            if !numbered && !is_obfuscated(&name) {
+                continue;
+            }
+            let Ok(f) = File::open(&p) else { continue };
+            let mut head = vec![0u8; 1 << 20];
+            read_fill(&f, &mut head, 0);
+            let Some(t) = episode_title(&head) else { continue };
+            let dest = p.with_file_name(format!("{t}.{ext}"));
+            if !dest.exists() && fs::rename(&p, &dest).is_ok() {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Unpacks RAR, 7z and ZIP archives found in the output. Returns messages and the
+    /// number of archives unpacked.
+    fn extract_nested(&self) -> (Vec<String>, usize) {
+        let (mut msgs, mut n) = (vec![], 0);
+        let files = self.output_files();
+        let fname = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        // RAR sets: one entry per (folder, base name), opened at its first volume.
+        let mut rars: std::collections::BTreeMap<(PathBuf, String), Vec<(u64, PathBuf)>> = Default::default();
+        for p in &files {
+            let name = fname(p);
+            if looks_like_rar(&name) {
+                if let Some(o) = rar::name_order(&name) {
+                    rars.entry((p.parent().unwrap_or(&self.work).to_path_buf(), rar::base_name(&name))).or_default().push((o, p.clone()));
+                }
+            }
+        }
+        for (_, mut vols) in rars {
+            vols.sort();
+            let first = &vols[0].1;
+            match self.unrar_one(first) {
+                Ok((k, b)) => {
+                    msgs.push(format!("unpacked {k} file(s), {:.2} GB from nested {}", b as f64 / 1e9, fname(first)));
+                    for (_, p) in &vols {
+                        let _ = fs::remove_file(p);
+                    }
+                    n += 1;
+                }
+                Err(e) => msgs.push(format!("nested {}: {e}", fname(first))),
+            }
+        }
+        for p in &files {
+            let l = fname(p).to_ascii_lowercase();
+            let r = if l.ends_with(".7z") {
+                self.unpack_7z(&[(1, p.clone())])
+            } else if l.ends_with(".zip") {
+                self.unzip(p)
+            } else {
+                continue;
+            };
+            match r {
+                Ok((k, b)) => {
+                    msgs.push(format!("unpacked {k} file(s), {:.2} GB from nested {}", b as f64 / 1e9, fname(p)));
+                    let _ = fs::remove_file(p);
+                    n += 1;
+                }
+                Err(e) => msgs.push(format!("nested {}: {e}", fname(p))),
+            }
+        }
+        (msgs, n)
+    }
+
+    fn unzip(&self, p: &Path) -> Result<(usize, u64), String> {
+        let f = File::open(p).map_err(|e| e.to_string())?;
+        let mut written: Vec<PathBuf> = vec![];
+        let r = (|| {
+            let (mut n, mut bytes) = (0, 0);
+            for e in zip::entries(&f)? {
+                // Entry names come from the archive: never let them escape the job folder.
+                let rel = sanitize(&e.name.replace('\\', "/"));
+                if e.is_dir() {
+                    let _ = fs::create_dir_all(self.work.join(&rel));
+                    continue;
+                }
+                let rel = match rel.file_name() {
+                    Some(x) => rel.with_file_name(self.output_name(&x.to_string_lossy())),
+                    None => rel,
+                };
+                let dest = self.work.join(&rel);
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent).map_err(|x| x.to_string())?;
+                }
+                written.push(dest.clone());
+                let mut out = File::create(&dest).map_err(|x| x.to_string())?;
+                bytes += zip::extract(&f, &e, &mut out)?;
+                n += 1;
+            }
+            if n == 0 {
+                return Err("archive contains no files".to_string());
+            }
+            Ok((n, bytes))
+        })();
+        if r.is_err() {
+            for p in &written {
+                let _ = fs::remove_file(p);
+            }
+        }
+        r
+    }
+
     // ---------- par2 repair ----------
 
     fn vread(plan: &Plan, files: &[Option<File>], src: VSrc, off: u64, buf: &mut [u8]) {
@@ -2002,6 +2336,7 @@ impl Job {
                 parts.push(format!("{n} files renamed from par2"));
             }
             let _ = fs::remove_dir_all(self.work.join(".aux"));
+            parts.extend(self.tidy_output());
             if let Some(done) = &self.done_dir {
                 if let Some(parent) = done.parent() {
                     let _ = fs::create_dir_all(parent);
@@ -2027,3 +2362,23 @@ impl Job {
 
 /// The global work queue, needed to schedule repair downloads from finalize threads.
 pub static QUEUE: OnceLock<Arc<Queues>> = OnceLock::new();
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mkv_titles() {
+        let title = "KAOS.S01E02.Episode.2.1080p.NF.WEB-DL-GRiMM";
+        let mut info = vec![0x2A, 0xD7, 0xB1, 0x83, 0x0F, 0x42, 0x40, 0x7B, 0xA9, 0x80 | title.len() as u8];
+        info.extend_from_slice(title.as_bytes());
+        let mut d = vec![0x1A, 0x45, 0xDF, 0xA3, 0x84, 0x42, 0x86, 0x81, 0x01];
+        d.extend([0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        d.extend([0x11, 0x4D, 0x9B, 0x74, 0x82, 0xEC, 0x80]);
+        d.extend([0x15, 0x49, 0xA9, 0x66, 0x80 | info.len() as u8]);
+        d.extend(&info);
+        assert_eq!(mkv_title(&d).as_deref(), Some(title));
+        assert_eq!(episode_title(&d).as_deref(), Some(title));
+        assert!(mkv_title(b"\x1a\x45\xdf\xa3garbage").is_none());
+    }
+}
