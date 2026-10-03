@@ -176,7 +176,6 @@ fn parse5(b: &[u8], start: usize) -> Option<RarVol> {
                 let _os = vint(b, &mut p)?;
                 let nlen = vint(b, &mut p)? as usize;
                 let name = String::from_utf8_lossy(b.get(p..p + nlen)?).into_owned();
-                p += nlen;
                 // Extra area: look for an encryption record (type 1).
                 let mut enc = false;
                 let mut ep = hend.checked_sub(extra as usize)?;

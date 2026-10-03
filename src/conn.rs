@@ -20,6 +20,8 @@ pub struct SStats {
     pub missing: AtomicU64,
     pub errors: AtomicU64,
     pub live: AtomicU64,
+    /// Connections being opened or logging in.
+    pub opening: AtomicU64,
     pub crc_errors: AtomicU64,
     /// Connection attempts that failed in a row (reset by any successful login).
     pub consec_fail: AtomicU64,
@@ -86,20 +88,10 @@ mod danger {
         ) -> Result<ServerCertVerified, rustls::Error> {
             Ok(ServerCertVerified::assertion())
         }
-        fn verify_tls12_signature(
-            &self,
-            _: &[u8],
-            _: &CertificateDer<'_>,
-            _: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        fn verify_tls12_signature(&self, _: &[u8], _: &CertificateDer<'_>, _: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
             Ok(HandshakeSignatureValid::assertion())
         }
-        fn verify_tls13_signature(
-            &self,
-            _: &[u8],
-            _: &CertificateDer<'_>,
-            _: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        fn verify_tls13_signature(&self, _: &[u8], _: &CertificateDer<'_>, _: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
             Ok(HandshakeSignatureValid::assertion())
         }
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -110,10 +102,7 @@ mod danger {
 
 pub fn tls_config(insecure: bool) -> Arc<rustls::ClientConfig> {
     let cfg = if insecure {
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(danger::NoVerify))
-            .with_no_client_auth()
+        rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(danger::NoVerify)).with_no_client_auth()
     } else {
         let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
         rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth()
@@ -161,7 +150,7 @@ fn connect(cfg: &ServerCfg, tls: &Arc<rustls::ClientConfig>) -> io::Result<Box<d
         Some(c) => c.to_socket_addrs()?.collect(),
         None => (cfg.host.as_str(), cfg.port).to_socket_addrs()?.collect(),
     };
-    let addr = *addrs.first().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no address"))?;
+    let addr = *addrs.first().ok_or_else(|| io::Error::other("no address"))?;
     let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(15))?;
     tcp.set_nodelay(true)?;
     tcp.set_read_timeout(Some(Duration::from_secs(90)))?;
@@ -169,8 +158,8 @@ fn connect(cfg: &ServerCfg, tls: &Arc<rustls::ClientConfig>) -> io::Result<Box<d
     if !cfg.tls {
         return Ok(Box::new(tcp));
     }
-    let name = ServerName::try_from(cfg.host.clone()).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    let conn = rustls::ClientConnection::new(tls.clone(), name).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let name = ServerName::try_from(cfg.host.clone()).map_err(io::Error::other)?;
+    let conn = rustls::ClientConnection::new(tls.clone(), name).map_err(io::Error::other)?;
     let sock = BigSock { s: tcp, buf: vec![0u8; 1 << 20].into_boxed_slice(), pos: 0, end: 0 };
     Ok(Box::new(rustls::StreamOwned::new(conn, sock)))
 }
@@ -186,7 +175,7 @@ struct Rd {
 }
 
 fn err(msg: String) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, msg)
+    io::Error::other(msg)
 }
 
 impl Rd {
@@ -297,12 +286,63 @@ fn pop_live(ctx: &ConnCtx, wait: Option<Duration>) -> Option<Work> {
     }
 }
 
-/// Connection failures in a row (with no live connection) before a server is marked down.
+const PIPELINE_SECS: f64 = 1.0;
+const ARTICLE_EST: f64 = 750_000.0;
+
+/// Sizes a connection's pipeline: the requests in flight cover what the connection
+/// delivered in its last responses over PIPELINE_SECS (at least one, at most `max`).
+/// Requests cannot be taken back once sent, so a slow server must not sit on articles
+/// that faster ones could fetch meanwhile. Throughput is summed over several responses,
+/// so an occasional slow article does not shorten the pipeline of a fast server.
+struct Pace {
+    max: usize,
+    window: usize,
+    /// (bytes, seconds) of recent responses that followed another one.
+    recent: [(f64, f64); 16],
+    n: usize,
+    mark: std::time::Instant,
+    lone: bool,
+}
+
+impl Pace {
+    fn new(max: usize) -> Self {
+        Pace { max, window: 1, recent: [(0.0, 0.0); 16], n: 0, mark: std::time::Instant::now(), lone: true }
+    }
+
+    /// Requests are being sent while none are outstanding.
+    fn start(&mut self) {
+        (self.mark, self.lone) = (std::time::Instant::now(), true);
+    }
+
+    /// A response arrived with `bytes` of article data (0 for a status-only reply).
+    fn answered(&mut self, bytes: f64) {
+        let secs = self.mark.elapsed().as_secs_f64();
+        self.mark = std::time::Instant::now();
+        let fit = |b: f64, s: f64| ((b / s.max(1e-6) * PIPELINE_SECS / ARTICLE_EST) as usize).clamp(1, self.max).min(2 * self.window);
+        if std::mem::replace(&mut self.lone, false) {
+            // A lone request also waited a round trip: only a reason to lengthen the pipeline.
+            if bytes > 0.0 {
+                self.window = self.window.max(fit(bytes, secs));
+            }
+            return;
+        }
+        self.recent[self.n % self.recent.len()] = (bytes, secs);
+        self.n += 1;
+        let (b, s) = self.recent.iter().take(self.n).fold((0.0, 0.0), |a, r| (a.0 + r.0, a.1 + r.1));
+        if b > 0.0 {
+            self.window = fit(b, s);
+        }
+    }
+}
+
+/// Connection failures in a row, with no session live, before a server is marked down.
+/// While other connections are still logging in it takes one failure per connection:
+/// a server at its account's connection limit refuses the extra ones but is not down.
 const DOWN_AFTER: u64 = 3;
 
 fn note_error(ctx: &ConnCtx, e: &io::Error) {
     let n = ctx.st.errors.fetch_add(1, Relaxed);
-    if n < 5 || n % 100 == 0 {
+    if n < 5 || n.is_multiple_of(100) {
         eprintln!("[{}] {e}", ctx.cfg.name);
     }
     *ctx.st.last_error.lock().unwrap() = e.to_string();
@@ -328,9 +368,9 @@ pub fn run(ctx: ConnCtx) {
     let mut backoff = 1;
     loop {
         if ctx.q.is_down(ctx.idx) {
-            std::thread::sleep(Duration::from_secs(backoff));
-            backoff = (backoff * 2).min(30);
-            if !ctx.q.is_down(ctx.idx) {
+            backoff = 1;
+            std::thread::sleep(Duration::from_millis(200));
+            if !ctx.q.is_down(ctx.idx) || !ctx.q.claim_probe(ctx.idx) {
                 continue;
             }
             match probe(&ctx) {
@@ -339,7 +379,6 @@ pub fn run(ctx: ConnCtx) {
                     eprintln!("[{}] reachable again", ctx.cfg.name);
                     ctx.st.consec_fail.store(0, Relaxed);
                     ctx.q.set_down(ctx.idx, false);
-                    backoff = 1;
                 }
                 Err(e) => note_error(&ctx, &e),
             }
@@ -355,8 +394,17 @@ pub fn run(ctx: ConnCtx) {
             continue;
         }
         let mut inflight: VecDeque<Work> = VecDeque::new();
-        match session(&ctx, &mut inflight) {
+        let mut worked = false;
+        match session(&ctx, &mut inflight, &mut worked) {
             Ok(()) => backoff = 1,
+            // A session that was answering requests and broke off reconnects right away.
+            Err(e) if worked => {
+                note_error(&ctx, &e);
+                for w in ctx.q.give_back(ctx.idx, inflight.drain(..).collect()) {
+                    w.missing(&ctx.q);
+                }
+                backoff = 1;
+            }
             Err(e) => {
                 note_error(&ctx, &e);
                 ctx.q.login_failed(ctx.idx, ctx.st.live.load(Relaxed));
@@ -364,40 +412,56 @@ pub fn run(ctx: ConnCtx) {
                     w.missing(&ctx.q);
                 }
                 let fails = ctx.st.consec_fail.fetch_add(1, Relaxed) + 1;
-                if fails >= DOWN_AFTER && ctx.st.live.load(Relaxed) == 0 && !ctx.q.is_down(ctx.idx) {
+                let settled = ctx.st.opening.load(Relaxed) == 0 || fails >= ctx.cfg.conns as u64;
+                if fails >= DOWN_AFTER && ctx.st.live.load(Relaxed) == 0 && settled && !ctx.q.is_down(ctx.idx) {
                     eprintln!("[{}] marked down after {fails} failed connection attempts", ctx.cfg.name);
                     ctx.q.set_down(ctx.idx, true);
                 }
-                std::thread::sleep(Duration::from_secs(backoff));
+                // Once the server is marked down, the shared probe takes over.
+                let until = std::time::Instant::now() + Duration::from_secs(backoff);
                 backoff = (backoff * 2).min(30);
+                while std::time::Instant::now() < until && !ctx.q.is_down(ctx.idx) {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
             }
         }
     }
 }
 
-fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>) -> io::Result<()> {
+fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>, worked: &mut bool) -> io::Result<()> {
+    struct Count<'a>(&'a AtomicU64);
+    impl<'a> Count<'a> {
+        fn new(c: &'a AtomicU64) -> Self {
+            c.fetch_add(1, Relaxed);
+            Count(c)
+        }
+    }
+    impl Drop for Count<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Relaxed);
+        }
+    }
     ctx.q.connecting(ctx.idx);
+    let opening = Count::new(&ctx.st.opening);
     let s = connect(&ctx.cfg, &ctx.tls)?;
     let mut rd = Rd { s, buf: vec![0; 8 << 20], start: 0, end: 0, rx: Some(ctx.st.clone()) };
     login(&mut rd, &ctx.cfg)?;
     ctx.q.login_ok(ctx.idx);
     ctx.st.consec_fail.store(0, Relaxed);
-    ctx.st.live.fetch_add(1, Relaxed);
-    struct Live<'a>(&'a AtomicU64);
-    impl Drop for Live<'_> {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Relaxed);
-        }
+    let _live = Count::new(&ctx.st.live);
+    drop(opening);
+    if ctx.q.is_down(ctx.idx) {
+        eprintln!("[{}] reachable again", ctx.cfg.name);
+        ctx.q.set_down(ctx.idx, false);
     }
-    let _live = Live(&ctx.st.live);
     let fin = memmem::Finder::new(b"\r\n.\r\n");
     let mut out: Vec<u8> = Vec::with_capacity(1 << 20);
     let mut req = String::with_capacity(4096);
     let mut sent = 0usize; // inflight[..sent] have been requested
     let mut last_resp = std::time::Instant::now();
+    let mut pace = Pace::new(ctx.depth);
     loop {
-        // Top up the pipeline.
-        while inflight.len() < ctx.depth {
+        while inflight.len() < pace.window {
             match pop_live(ctx, None) {
                 Some(w) => inflight.push_back(w),
                 None => break,
@@ -419,18 +483,26 @@ fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>) -> io::Result<()> {
                 req.push_str(w.job.msgid(w.file, w.seg));
                 req.push_str("\r\n");
             }
+            if sent == 0 {
+                pace.start();
+            }
             sent = inflight.len();
             send(&mut rd, &req)?;
         }
         let status = rd.line()?;
+        *worked = true;
         let code = status.get(..3).unwrap_or("");
         let since = last_resp.elapsed();
         last_resp = std::time::Instant::now();
+        if code != "222" {
+            pace.answered(0.0);
+        }
         match code {
             "222" => {
                 let (s, e) = rd.block(&fin)?;
                 let w = inflight.pop_front().unwrap();
                 sent -= 1;
+                pace.answered((e - s) as f64);
                 LIMIT.consume((e - s) as u64);
                 ctx.q.record(ctx.idx, true, w.tried != 0);
                 w.job.route.record(ctx.idx, true);
@@ -441,7 +513,7 @@ fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>) -> io::Result<()> {
                     }
                     Err(e) => {
                         if ctx.st.crc_errors.fetch_add(1, Relaxed) < 3 {
-                            eprintln!("[{}] decode error {:?} for {}", ctx.cfg.name, e, w.job.msgid(w.file, w.seg));
+                            eprintln!("[{}] decode error ({e}) for {}", ctx.cfg.name, w.job.msgid(w.file, w.seg));
                         }
                         if let Some(w) = ctx.q.retry_elsewhere(ctx.idx, w) {
                             w.missing(&ctx.q);
@@ -480,20 +552,4 @@ fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>) -> io::Result<()> {
             _ => return Err(err(format!("unexpected: {}", &status[..status.len().min(80)]))),
         }
     }
-}
-
-/// Debug helper: fetches one article body (raw, as sent by the server).
-pub fn fetch_raw(cfg: &ServerCfg, msgid: &str) -> io::Result<Vec<u8>> {
-    let tls = tls_config(cfg.insecure);
-    let s = connect(cfg, &tls)?;
-    let mut rd = Rd { s, buf: vec![0; 8 << 20], start: 0, end: 0, rx: None };
-    login(&mut rd, cfg)?;
-    send(&mut rd, &format!("BODY {msgid}\r\n"))?;
-    let status = rd.line()?;
-    if !status.starts_with("222") {
-        return Err(err(format!("status: {status}")));
-    }
-    let fin = memmem::Finder::new(b"\r\n.\r\n");
-    let (a, b) = rd.block(&fin)?;
-    Ok(rd.buf[a..b].to_vec())
 }

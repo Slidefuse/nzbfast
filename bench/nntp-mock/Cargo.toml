@@ -1,0 +1,11 @@
+[package]
+name = "nntp-mock"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rustls = "0.23"
+rcgen = "0.13"
+memchr = "2"
+crc32fast = "1"

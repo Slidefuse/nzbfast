@@ -88,7 +88,9 @@ fn proc_usage() -> (f64, u64) {
 }
 
 fn fs_free(path: &std::path::Path) -> (u64, u64) {
-    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else { return (0, 0) };
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return (0, 0);
+    };
     let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
         return (0, 0);
@@ -179,7 +181,7 @@ impl Hub {
                 }
                 ring.1.push_back(Sample { rx: total as f32, nic: nic as f32, srv: srv.iter().map(|x| *x as f32).collect() });
             }
-            if tick % 10 == 0 {
+            if tick.is_multiple_of(10) {
                 let (c, r) = proc_usage();
                 cpu_pct = (c - cpu_prev) * 100.0;
                 cpu_prev = c;
@@ -192,7 +194,23 @@ impl Hub {
             if self.clients.load(Relaxed) == 0 {
                 continue;
             }
-            let snap = self.build(&eng, tick, total, nic, (r1, nic1, r5, nic5), &srv, &srv1, cpu_pct, rss, free, move_rate, &mut job_rate, &mut move_rate_j, &mut cache, dt);
+            let snap = self.build(
+                &eng,
+                tick,
+                total,
+                nic,
+                (r1, nic1, r5, nic5),
+                &srv,
+                &srv1,
+                cpu_pct,
+                rss,
+                free,
+                move_rate,
+                &mut job_rate,
+                &mut move_rate_j,
+                &mut cache,
+                dt,
+            );
             let mut s = self.snap.lock().unwrap();
             *s = (tick, Arc::from(snap.as_str()));
             drop(s);

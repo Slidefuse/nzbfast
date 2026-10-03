@@ -143,7 +143,6 @@ pub fn extract(f: &File, e: &Entry, out: &mut impl Write) -> Result<u64, String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     /// Builds a zip with one stored and one deflated entry and reads both back.
     #[test]

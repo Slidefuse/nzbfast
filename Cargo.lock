@@ -431,6 +431,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nntp-mock"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "memchr",
+ "rcgen",
+ "rustls",
+]
+
+[[package]]
 name = "num-conv"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -445,7 +455,6 @@ dependencies = [
  "libc",
  "md-5",
  "memchr",
- "rcgen",
  "rustls",
  "serde",
  "serde_json",

@@ -17,7 +17,8 @@ const UI_COOKIE: &str = "nzbfast_ui";
 
 /// Link speed of the NIC in bytes/s (10 Gbit/s if unknown).
 pub fn line_speed(nic: &str) -> u64 {
-    let mbit: u64 = std::fs::read_to_string(format!("/sys/class/net/{nic}/speed")).ok().and_then(|s| s.trim().parse().ok()).filter(|v| *v > 0).unwrap_or(10_000);
+    let mbit: u64 =
+        std::fs::read_to_string(format!("/sys/class/net/{nic}/speed")).ok().and_then(|s| s.trim().parse().ok()).filter(|v| *v > 0).unwrap_or(10_000);
     mbit * 125_000
 }
 
@@ -516,7 +517,9 @@ fn queue_list(eng: &Engine, p: &Params) -> Response {
 }
 
 fn disk(path: &str) -> (u64, u64) {
-    let Ok(c) = std::ffi::CString::new(path) else { return (0, 0) };
+    let Ok(c) = std::ffi::CString::new(path) else {
+        return (0, 0);
+    };
     let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
         return (0, 0);
@@ -699,7 +702,11 @@ fn server_stats(eng: &Engine) -> Response {
 fn get_files(eng: &Engine, p: &Params) -> Response {
     let id = p.get("value").unwrap_or("");
     let st = eng.store.lock().unwrap();
-    let Some(e) = st.queue.iter().find(|e| e.m.nzo == id) else { return Response::json(&json!({"files": []})) };
+    let Some(e) = st.queue.iter().find(|e| e.m.nzo == id) else {
+        return Response::json(&json!({"files": []}));
+    };
     let (t, d) = e.progress();
-    Response::json(&json!({"files": [{"filename": e.m.name, "mb": mb(t), "mbleft": mb(t - d), "bytes": t, "age": age(e.m.added), "nzf_id": e.m.nzo, "status": if e.run.is_some() { "active" } else { "queued" }}]}))
+    Response::json(
+        &json!({"files": [{"filename": e.m.name, "mb": mb(t), "mbleft": mb(t - d), "bytes": t, "age": age(e.m.added), "nzf_id": e.m.nzo, "status": if e.run.is_some() { "active" } else { "queued" }}]}),
+    )
 }

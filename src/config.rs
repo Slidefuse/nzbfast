@@ -54,7 +54,9 @@ pub fn parse_sab_ini(path: &str) -> Result<SabIni, String> {
             section = t.trim_matches(['[', ']']).to_string();
             continue;
         }
-        let Some((k, v)) = t.split_once('=') else { continue };
+        let Some((k, v)) = t.split_once('=') else {
+            continue;
+        };
         let (k, v) = (k.trim().to_string(), unquote(v));
         match section.as_str() {
             "misc" => {

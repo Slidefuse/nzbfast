@@ -2,11 +2,15 @@
 name = "nzbfast"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.89"
+description = "A Usenet (NZB) downloader built for multi-gigabit links, with a SABnzbd-compatible API"
+readme = "README.md"
+keywords = ["usenet", "nzb", "nntp", "downloader", "sabnzbd"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 rustls = "0.23"
 webpki-roots = "0.26"
-rcgen = "0.13"
 flate2 = "1"
 memchr = "2"
 crc32fast = "1"
@@ -18,8 +22,18 @@ toml = "0.8"
 unrar = "0.5"
 sevenz-rust2 = { version = "0.23", default-features = false, features = ["aes256", "bzip2", "ppmd"] }
 
+[workspace]
+members = [".", "bench/nntp-mock"]
+default-members = ["."]
+
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+strip = true
+
+# `cargo build --profile profiling` keeps symbols for perf.
+[profile.profiling]
+inherits = "release"
+strip = false
 debug = 1

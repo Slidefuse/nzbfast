@@ -149,7 +149,6 @@ pub struct Job {
     sample_known: AtomicUsize,
     sample_missing: AtomicUsize,
     want_bytes: AtomicU64,
-    pub bytes_total: u64,
     pub bytes_done: AtomicU64,
     /// Progress in NZB (encoded) bytes: segments handled (downloaded or given up on)
     /// versus segments scheduled, including recovery volumes fetched for a repair.
@@ -167,8 +166,11 @@ pub struct Job {
     pub grant: AtomicU64,
     pub taken: AtomicU64,
     pub started: Instant,
-    pub finished: Arc<dyn Fn(&Job, JobResult) + Send + Sync>,
+    pub finished: OnFinish,
 }
+
+/// Called once when a job has finished (or failed).
+pub type OnFinish = Arc<dyn Fn(&Job, JobResult) + Send + Sync>;
 
 pub struct JobResult {
     pub ok: bool,
@@ -443,13 +445,7 @@ impl IoOwner for Job {
 }
 
 impl Job {
-    pub fn new(
-        id: usize,
-        nzb: Nzb,
-        work: PathBuf,
-        done_dir: Option<PathBuf>,
-        finished: Arc<dyn Fn(&Job, JobResult) + Send + Sync>,
-    ) -> Arc<Job> {
+    pub fn new(id: usize, nzb: Nzb, work: PathBuf, done_dir: Option<PathBuf>, finished: OnFinish) -> Arc<Job> {
         let files: Vec<JFile> = nzb
             .files
             .into_iter()
@@ -487,7 +483,6 @@ impl Job {
             sample_known: AtomicUsize::new(0),
             sample_missing: AtomicUsize::new(0),
             want_bytes: AtomicU64::new(0),
-            bytes_total,
             bytes_done: AtomicU64::new(0),
             enc_total: AtomicU64::new(bytes_total),
             enc_done: AtomicU64::new(0),
@@ -501,13 +496,6 @@ impl Job {
             started: Instant::now(),
             finished,
         })
-    }
-
-    /// Tidies an already finished download folder (`nzbfast tidy`).
-    pub fn tidy_dir(dir: &Path, name: &str, password: Option<String>) -> Vec<String> {
-        let nzb = Nzb { name: name.to_string(), files: vec![], password };
-        let job = Job::new(0, nzb, dir.to_path_buf(), None, Arc::new(|_: &Job, _| {}));
-        job.tidy_output()
     }
 
     /// Queues work for this job, or holds it back while the job is paused.
@@ -569,8 +557,12 @@ impl Job {
         let aux = self.work.join(".aux");
         let mut n = 0;
         for (k, m) in map.iter().enumerate() {
-            let Some(VSrc::Out { out, .. }) = m else { continue };
-            let Some(orig) = plan.paths.get(*out) else { continue };
+            let Some(VSrc::Out { out, .. }) = m else {
+                continue;
+            };
+            let Some(orig) = plan.paths.get(*out) else {
+                continue;
+            };
             let path = self.cur(orig);
             let want = sanitize(&set.files[&set.recovery_ids[k]].name);
             if !path.starts_with(&aux) || path.file_name() == want.file_name() {
@@ -604,19 +596,27 @@ impl Job {
                 continue;
             }
             let path = self.cur(&plan.paths[out]);
-            let Some(name) = path.file_name().map(|s| s.to_string_lossy().into_owned()) else { continue };
+            let Some(name) = path.file_name().map(|s| s.to_string_lossy().into_owned()) else {
+                continue;
+            };
             if known.contains(name.as_str()) {
                 continue;
             }
-            let Ok(meta) = fs::metadata(&path) else { continue };
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
             let Ok(f) = File::open(&path) else { continue };
             let mut head = vec![0u8; (meta.len() as usize).min(16384)];
             read_fill(&f, &mut head, 0);
             let id = par2::md5_16k(&head);
             let mut hits = set.files.values().filter(|d| d.len == meta.len() && d.md5_16k == id);
-            let (Some(d), None) = (hits.next(), hits.next()) else { continue };
+            let (Some(d), None) = (hits.next(), hits.next()) else {
+                continue;
+            };
             let want = sanitize(&d.name);
-            let Some(dst) = path.parent().map(|p| p.join(want.file_name().unwrap_or_default())) else { continue };
+            let Some(dst) = path.parent().map(|p| p.join(want.file_name().unwrap_or_default())) else {
+                continue;
+            };
             if !dst.exists() && fs::rename(&path, &dst).is_ok() {
                 self.renamed.lock().unwrap().insert(plan.paths[out].clone(), dst);
                 n += 1;
@@ -1000,11 +1000,8 @@ impl Job {
                 continue;
             }
             let whole = p.data.len() as u64 == p.info.size;
-            ids[i] = FileId {
-                yname: name.clone(),
-                size: p.info.size,
-                md5_16k: if p.data.len() >= 16384 || whole { Some(par2::md5_16k(&p.data)) } else { None },
-            };
+            ids[i] =
+                FileId { yname: name.clone(), size: p.info.size, md5_16k: if p.data.len() >= 16384 || whole { Some(par2::md5_16k(&p.data)) } else { None } };
             if rar::is_rar(&p.data) {
                 if let Some(v) = rar::parse_volume(&p.data) {
                     if v.stored && !v.encrypted && v.data_start <= p.data.len() as u64 {
@@ -1099,7 +1096,9 @@ impl Job {
             // The packed file's first bytes follow the RAR headers in the first volume.
             let first = probes[g[0].0].as_ref().and_then(|p| p.data.get(g[0].1.data_start as usize..)).unwrap_or(&[]);
             let out_name = deobf(&inner, first);
-            let Target::Plain { out } = make(&self.work, &out_name, g[0].1.unp_size, &mut outs, &mut paths) else { continue };
+            let Target::Plain { out } = make(&self.work, &out_name, g[0].1.unp_size, &mut outs, &mut paths) else {
+                continue;
+            };
             let mut off = 0;
             let mut vidx = vec![];
             for c in &g {
@@ -1210,7 +1209,9 @@ impl Job {
     fn extract_tail_files(&self, plan: &Plan) -> Vec<String> {
         let mut res = vec![];
         for set in &plan.sets {
-            let Some(&last) = set.vols.last() else { continue };
+            let Some(&last) = set.vols.last() else {
+                continue;
+            };
             let vm = &plan.vols[last];
             let tail = vm.tail.lock().unwrap().clone();
             for f in rar::tail_files(&tail, vm.info.rar5) {
@@ -1247,7 +1248,8 @@ impl Job {
         let mut order: HashMap<PathBuf, usize> = HashMap::new();
         // The directory is authoritative: repair may have added or renamed volumes.
         let index: HashMap<PathBuf, usize> = plan.raw_rar.iter().map(|&o| (self.cur(&plan.paths[o]), nzb_order(o))).collect();
-        let mut vols: Vec<PathBuf> = fs::read_dir(self.work.join(".aux").join("rar")).map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect()).unwrap_or_default();
+        let mut vols: Vec<PathBuf> =
+            fs::read_dir(self.work.join(".aux").join("rar")).map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect()).unwrap_or_default();
         vols.sort();
         for p in &vols {
             let o_order = index.get(p).copied().unwrap_or(usize::MAX);
@@ -1272,9 +1274,9 @@ impl Job {
         // with the start of a compressed one (e.g. a small "rename" file in part01), and
         // extracting it would consume that volume.
         let clean = others.is_empty()
-            && groups.values().all(|g| {
-                g.iter().map(|c| c.1.pack_size).sum::<u64>() == g[0].1.unp_size && !g[0].1.split_before && !g.last().unwrap().1.split_after
-            });
+            && groups
+                .values()
+                .all(|g| g.iter().map(|c| c.1.pack_size).sum::<u64>() == g[0].1.unp_size && !g[0].1.split_before && !g.last().unwrap().1.split_after);
         if !clean {
             for (_, g) in groups.drain() {
                 for (p, v, _) in g {
@@ -1416,7 +1418,8 @@ impl Job {
     /// Unpacks 7z archives (split `.7z.NNN` volumes are read back to back).
     fn extract_7z(&self, _plan: &Plan) -> (Vec<String>, bool) {
         let mut sets: std::collections::BTreeMap<String, Vec<(u32, PathBuf)>> = Default::default();
-        let mut zvols: Vec<PathBuf> = fs::read_dir(self.work.join(".aux").join("7z")).map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect()).unwrap_or_default();
+        let mut zvols: Vec<PathBuf> =
+            fs::read_dir(self.work.join(".aux").join("7z")).map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect()).unwrap_or_default();
         zvols.sort();
         for p in zvols {
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1608,7 +1611,7 @@ impl Job {
     /// files": raw split files (`x.mkv.001`…), files whose names lost their extension,
     /// and archives inside the archive (unpacked only while there is no video yet, so
     /// bundled extras are left alone).
-    pub fn tidy_output(&self) -> Vec<String> {
+    fn tidy_output(&self) -> Vec<String> {
         let mut msgs = vec![];
         for _ in 0..3 {
             let n = self.join_splits();
@@ -1636,7 +1639,9 @@ impl Job {
         let mut groups: std::collections::BTreeMap<PathBuf, Vec<(u32, PathBuf)>> = Default::default();
         for p in self.output_files() {
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let Some((base, ext)) = name.rsplit_once('.') else { continue };
+            let Some((base, ext)) = name.rsplit_once('.') else {
+                continue;
+            };
             if ext.len() != 3 || !ext.bytes().all(|c| c.is_ascii_digit()) || !base.contains('.') {
                 continue;
             }
@@ -1669,16 +1674,18 @@ impl Job {
     /// the job name when its own name is obfuscated).
     fn name_by_magic(&self) -> usize {
         const KNOWN: &[&str] = &[
-            "mkv", "mp4", "avi", "m4v", "ts", "m2ts", "wmv", "mov", "mpg", "mpeg", "webm", "flv", "vob", "iso", "img", "ogm", "divx",
-            "3gp", "rmvb", "rm", "rar", "zip", "7z", "par2", "nfo", "sfv", "srr", "srs", "nzb", "jpg", "jpeg", "png", "gif", "txt",
-            "url", "md5", "srt", "sub", "idx", "ass", "ssa", "vtt", "sup", "exe", "pdf", "mp3", "flac", "m4a", "ac3", "dts", "aac",
-            "epub", "html", "htm", "db", "xml", "json",
+            "mkv", "mp4", "avi", "m4v", "ts", "m2ts", "wmv", "mov", "mpg", "mpeg", "webm", "flv", "vob", "iso", "img", "ogm", "divx", "3gp", "rmvb", "rm",
+            "rar", "zip", "7z", "par2", "nfo", "sfv", "srr", "srs", "nzb", "jpg", "jpeg", "png", "gif", "txt", "url", "md5", "srt", "sub", "idx", "ass", "ssa",
+            "vtt", "sup", "exe", "pdf", "mp3", "flac", "m4a", "ac3", "dts", "aac", "epub", "html", "htm", "db", "xml", "json",
         ];
         let mut n = 0;
         for p in self.output_files() {
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
-            if KNOWN.contains(&ext.as_str()) || (ext.len() == 3 && ext.bytes().all(|c| c.is_ascii_digit())) || (!ext.is_empty() && ext.len() <= 4 && ext.starts_with('r') && ext[1..].bytes().all(|c| c.is_ascii_digit())) {
+            if KNOWN.contains(&ext.as_str())
+                || (ext.len() == 3 && ext.bytes().all(|c| c.is_ascii_digit()))
+                || (!ext.is_empty() && ext.len() <= 4 && ext.starts_with('r') && ext[1..].bytes().all(|c| c.is_ascii_digit()))
+            {
                 continue;
             }
             let Ok(f) = File::open(&p) else { continue };
@@ -1719,19 +1726,24 @@ impl Job {
         let mut n = 0;
         for p in self.output_files() {
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let Some((stem, ext)) = name.rsplit_once('.') else { continue };
+            let Some((stem, ext)) = name.rsplit_once('.') else {
+                continue;
+            };
             if !is_video(&name) {
                 continue;
             }
             let l = stem.to_ascii_lowercase();
-            let numbered = l.strip_prefix(&job).is_some_and(|r| r.is_empty() || (r.len() > 1 && r.starts_with('.') && r[1..].bytes().all(|c| c.is_ascii_digit())));
+            let numbered =
+                l.strip_prefix(&job).is_some_and(|r| r.is_empty() || (r.len() > 1 && r.starts_with('.') && r[1..].bytes().all(|c| c.is_ascii_digit())));
             if !numbered && !is_obfuscated(&name) {
                 continue;
             }
             let Ok(f) = File::open(&p) else { continue };
             let mut head = vec![0u8; 1 << 20];
             read_fill(&f, &mut head, 0);
-            let Some(t) = episode_title(&head) else { continue };
+            let Some(t) = episode_title(&head) else {
+                continue;
+            };
             let dest = p.with_file_name(format!("{t}.{ext}"));
             if !dest.exists() && fs::rename(&p, &dest).is_ok() {
                 n += 1;
@@ -1851,9 +1863,8 @@ impl Job {
                     let n;
                     if pos < ds {
                         n = ((ds - pos) as usize).min(b.len());
-                        let h = &vm.head;
-                        for k in 0..n {
-                            b[k] = h.get(pos as usize + k).copied().unwrap_or(0);
+                        for (k, x) in b[..n].iter_mut().enumerate() {
+                            *x = vm.head.get(pos as usize + k).copied().unwrap_or(0);
                         }
                     } else if pos < de {
                         n = ((de - pos) as usize).min(b.len());
@@ -1864,8 +1875,8 @@ impl Job {
                     } else {
                         n = ((vm.size - pos) as usize).min(b.len());
                         let t = vm.tail.lock().unwrap();
-                        for k in 0..n {
-                            b[k] = t.get((pos - de) as usize + k).copied().unwrap_or(0);
+                        for (k, x) in b[..n].iter_mut().enumerate() {
+                            *x = t.get((pos - de) as usize + k).copied().unwrap_or(0);
                         }
                     }
                     pos += n as u64;
@@ -2092,13 +2103,8 @@ impl Job {
         let set = self.load_par2(plan);
         if !set.ready() {
             let already: Vec<u32> = self.repair.lock().unwrap().outs.keys().copied().collect();
-            let smallest = self
-                .files
-                .iter()
-                .enumerate()
-                .filter(|(i, f)| f.skip && !already.contains(&(*i as u32)))
-                .min_by_key(|(_, f)| f.segs.len())
-                .map(|(i, _)| i);
+            let smallest =
+                self.files.iter().enumerate().filter(|(i, f)| f.skip && !already.contains(&(*i as u32))).min_by_key(|(_, f)| f.segs.len()).map(|(i, _)| i);
             match smallest {
                 Some(i) if allow_fetch => return self.fetch_recovery(&[i]),
                 _ => return RepairOutcome::Failed("par2: no usable index (cannot verify or repair)".into()),
@@ -2160,13 +2166,8 @@ impl Job {
             return RepairOutcome::Failed(format!("par2: {} slices damaged, only {} recovery blocks", damaged.len(), set.recv.len()));
         }
         let already: Vec<u32> = self.repair.lock().unwrap().outs.keys().copied().collect();
-        let mut cands: Vec<(u32, usize)> = self
-            .files
-            .iter()
-            .enumerate()
-            .filter(|(i, f)| f.skip && !already.contains(&(*i as u32)))
-            .map(|(i, f)| (f.par2_blocks.unwrap_or(1), i))
-            .collect();
+        let mut cands: Vec<(u32, usize)> =
+            self.files.iter().enumerate().filter(|(i, f)| f.skip && !already.contains(&(*i as u32))).map(|(i, f)| (f.par2_blocks.unwrap_or(1), i)).collect();
         cands.sort();
         let mut chosen = vec![];
         let mut have = 0;
@@ -2369,7 +2370,7 @@ mod tests {
 
     #[test]
     fn mkv_titles() {
-        let title = "KAOS.S01E02.Episode.2.1080p.NF.WEB-DL-GRiMM";
+        let title = "Show.S01E02.Episode.Title.1080p.WEB-DL-GRP";
         let mut info = vec![0x2A, 0xD7, 0xB1, 0x83, 0x0F, 0x42, 0x40, 0x7B, 0xA9, 0x80 | title.len() as u8];
         info.extend_from_slice(title.as_bytes());
         let mut d = vec![0x1A, 0x45, 0xDF, 0xA3, 0x84, 0x42, 0x86, 0x81, 0x01];

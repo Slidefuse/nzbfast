@@ -1,7 +1,8 @@
 #!/bin/bash
-# Build the benchmark corpus: unique random payloads packaged like real Usenet posts.
+# Builds the benchmark corpus (unique random payloads packaged like real Usenet posts,
+# 71 GB) and encodes it into articles for nntp-mock (73 GB). Needs rar, par2 and 7z.
 set -e
-B=/root/bench/bin; C=/root/bench/corpus; W=/dev/shm/corpus-work
+R=${BENCH_ROOT:-/root/bench}; B=$R/bin; C=$R/corpus; W=/dev/shm/corpus-work
 rnd() { openssl enc -aes-128-ctr -pass pass:"$1" -nosalt -pbkdf2 </dev/zero 2>/dev/null | head -c "$2"; }
 par() { (cd "$1" && $B/par2 c -q -q -r${3:-8} -n7 "$2.par2" * >/dev/null); }
 mkrel() { # name payload_bytes kind vol
@@ -16,10 +17,9 @@ mkrel() { # name payload_bytes kind vol
   esac
   echo "nfo $n" > $d/$n.nfo
   par $d $n 8
-  if [ "$kind" = obf ]; then :; fi
   rm -rf $W/$n
 }
-obfuscate() { # rename every file in release to random hex (names recoverable from par2)
+obfuscate() { # every file gets a random name (recoverable from par2)
   local d=$C/$1; for f in $d/*; do mv "$f" "$d/$(openssl rand -hex 12)"; done
 }
 G=1000000000
@@ -34,6 +34,8 @@ for i in 1 2 3; do mkrel Repair.R0$i.1080p-BENCH $((2*G)) rar 100m & done
 mkrel Dead.D01.1080p-BENCH $((2*G)) rar 100m &
 wait
 obfuscate Obf.O01.1080p-BENCH; obfuscate Obf.O02.1080p-BENCH
-# Reference checksums of payloads (regenerated deterministically)
-for d in $C/*; do n=$(basename $d); echo "$(rnd $n $(case $n in Movie*) echo $((4*G));; Show*) echo 400000000;; *) echo $((2*G));; esac) | md5sum | cut -d' ' -f1)  $n"; done > /root/bench/corpus.md5
-du -sh $C
+# Reference checksums of the payloads.
+for d in $C/*; do n=$(basename $d); echo "$(rnd $n $(case $n in Movie*) echo $((4*G));; Show*) echo 400000000;; *) echo $((2*G));; esac) | md5sum | cut -d' ' -f1)  $n"; done > $R/corpus.md5
+$B/nntp-mock gen --out $R/mock $C/*
+sed -i 's|^<nzb \(.*\)>$|<nzb \1>\n<head><meta type="password">benchpass</meta></head>|' $R/mock/Enc.E01.1080p-BENCH.nzb
+du -sh $C $R/mock

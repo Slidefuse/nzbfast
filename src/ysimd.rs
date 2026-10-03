@@ -64,7 +64,7 @@ unsafe fn avx512(src: &[u8], dst: *mut u8, c: &mut Carry) -> (usize, usize) {
         let real_eq = m_eq & !esc_next;
         let esc_next = (real_eq << 1) | esc;
         let lf_prev = ((m_lf & !esc_next) << 1) | lf;
-        let drop = (real_eq | ((m_cr | m_lf | (lf_prev & m_dot)) & !esc_next)) ;
+        let drop = real_eq | ((m_cr | m_lf | (lf_prev & m_dot)) & !esc_next);
         let keep = !drop;
         let mut d = _mm512_sub_epi8(v, k42);
         d = _mm512_mask_sub_epi8(d, esc_next, d, k64);
@@ -158,6 +158,7 @@ pub enum Kind {
 }
 
 /// Whether the CPU can run the given implementation.
+#[cfg(test)]
 pub fn supported(kind: Kind) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
@@ -176,13 +177,6 @@ pub fn supported(kind: Kind) -> bool {
 pub fn best() -> Kind {
     static K: OnceLock<Kind> = OnceLock::new();
     *K.get_or_init(|| {
-        if let Ok(v) = std::env::var("NZBFAST_YENC") {
-            return match v.as_str() {
-                "scalar" => Kind::Scalar,
-                "ssse3" => Kind::Ssse3,
-                _ => Kind::Avx512,
-            };
-        }
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx512vbmi2") && is_x86_feature_detected!("avx512bw") {
@@ -217,4 +211,55 @@ pub fn decode_with(kind: Kind, src: &[u8], out: &mut Vec<u8>) {
 
 pub fn decode(src: &[u8], out: &mut Vec<u8>) {
     decode_with(best(), src, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::yenc;
+
+    /// Every available decoder reproduces random data, biased toward bytes that need
+    /// escaping or dot-stuffing after the +42 shift.
+    #[test]
+    fn decoders_match() {
+        let mut seed: u64 = 0x1234_5678_9abc_def0;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as u8
+        };
+        let kinds: Vec<Kind> = [Kind::Scalar, Kind::Ssse3, Kind::Avx512].into_iter().filter(|k| supported(*k)).collect();
+        let mut out = vec![];
+        for t in 0..2000u64 {
+            let len = (t * 7919 % 5000) as usize + (t % 3) as usize;
+            let mut d: Vec<u8> = (0..len).map(|_| rnd()).collect();
+            for (k, b) in d.iter_mut().enumerate() {
+                if k % 11 == (t % 11) as usize {
+                    *b = [214u8, 224, 227, 19, 4, 238][k % 6];
+                }
+            }
+            let mut a = vec![];
+            yenc::encode_article("<t@t>", "t", d.len() as u64, 1, 1, 0, &d, &mut a);
+            let s = memchr::memmem::find(&a, b"=ypart").unwrap();
+            let ds = s + memchr::memchr(b'\n', &a[s..]).unwrap() + 1;
+            let de = memchr::memmem::rfind(&a, b"\r\n=yend").unwrap().max(ds);
+            for &k in &kinds {
+                decode_with(k, &a[ds..de], &mut out);
+                assert_eq!(out, d, "{k:?}, case {t}, len {len}");
+            }
+        }
+    }
+
+    #[test]
+    fn article_roundtrip() {
+        let data: Vec<u8> = (0..716_800u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let mut a = vec![];
+        yenc::encode_article("<x@y>", "f.bin", data.len() as u64, 1, 1, 0, &data, &mut a);
+        let body = &a[memchr::memchr(b'\n', &a).unwrap() + 1..a.len() - 3];
+        let mut out = vec![];
+        let (info, crc) = yenc::decode(body, &mut out).unwrap();
+        assert_eq!(out, data);
+        assert_eq!((info.name.as_str(), info.size, crc), ("f.bin", data.len() as u64, crc32fast::hash(&data)));
+    }
 }

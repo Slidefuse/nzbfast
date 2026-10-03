@@ -1,7 +1,6 @@
-//! yEnc decoding of raw NNTP article bodies (dot-stuffed, CRLF lines) and encoding
-//! (for the mock server).
+//! yEnc decoding of raw NNTP article bodies (dot-stuffed, CRLF lines).
 
-use memchr::{memchr3, memmem};
+use memchr::memmem;
 
 #[derive(Clone, Debug, Default)]
 pub struct YInfo {
@@ -53,6 +52,19 @@ pub enum YErr {
     Crc { want: u32, got: u32 },
 }
 
+impl std::fmt::Display for YErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            YErr::NoHeader => write!(f, "no =ybegin header"),
+            YErr::NoTrailer => write!(f, "no =yend trailer"),
+            YErr::SizeMismatch { want, got } => {
+                write!(f, "size mismatch: {got} bytes, expected {want}")
+            }
+            YErr::Crc { want, got } => write!(f, "CRC mismatch: {got:08x}, expected {want:08x}"),
+        }
+    }
+}
+
 /// Decodes one article body (the bytes between the status line and the terminating
 /// `.\r\n`). Returns the header info and CRC32 of the decoded data in `out`.
 pub fn decode(body: &[u8], out: &mut Vec<u8>) -> Result<(YInfo, u32), YErr> {
@@ -89,11 +101,7 @@ pub fn decode(body: &[u8], out: &mut Vec<u8>) -> Result<(YInfo, u32), YErr> {
     let end = if te > 0 && body[te - 1] == b'\r' { te - 1 } else { te };
     crate::ysimd::decode(&body[start..end.max(start)], out);
 
-    let want = if info.part > 0 || info.begin != 1 || info.end != info.size {
-        info.end + 1 - info.begin
-    } else {
-        info.size
-    };
+    let want = if info.part > 0 || info.begin != 1 || info.end != info.size { info.end + 1 - info.begin } else { info.size };
     let got = out.len() as u64;
     if want != got || part_size.is_some_and(|s| s != got) {
         return Err(YErr::SizeMismatch { want, got });
@@ -116,72 +124,10 @@ fn trim_cr(l: &[u8]) -> &[u8] {
     }
 }
 
-/// Decodes yEnc data in `b[start..]` (dot-stuffed CRLF lines) into `out`.
-#[inline(never)]
-pub fn decode_data(b: &[u8], start: usize, out: &mut Vec<u8>) {
-    out.clear();
-    out.reserve(b.len().saturating_sub(start));
-    let base = out.as_mut_ptr();
-    let mut o = 0usize;
-    let end = b.len();
-    let mut i = start;
-    if i < end && b[i] == b'.' {
-        i += 1;
-    }
-    // SAFETY: decoded output is never longer than the input region; capacity reserved above.
-    unsafe {
-        while i < end {
-            match memchr3(b'=', b'\r', b'\n', &b[i..end]) {
-                None => {
-                    sub42(&b[i..end], base.add(o));
-                    o += end - i;
-                    break;
-                }
-                Some(k) => {
-                    sub42(&b[i..i + k], base.add(o));
-                    o += k;
-                    let j = i + k;
-                    match b[j] {
-                        b'=' => {
-                            if j + 1 < end {
-                                *base.add(o) = b[j + 1].wrapping_sub(106);
-                                o += 1;
-                            }
-                            i = j + 2;
-                        }
-                        b'\r' => i = j + 1,
-                        _ => {
-                            i = j + 1;
-                            if i < end && b[i] == b'.' {
-                                i += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        out.set_len(o);
-    }
-}
-
-#[inline(always)]
-unsafe fn sub42(src: &[u8], dst: *mut u8) {
-    for (k, &c) in src.iter().enumerate() {
-        *dst.add(k) = c.wrapping_sub(42);
-    }
-}
-
 /// Encodes `data` as a complete NNTP BODY response (status line, dot-stuffed yEnc, terminator).
-pub fn encode_article(
-    msgid: &str,
-    name: &str,
-    file_size: u64,
-    part: u32,
-    total: u32,
-    begin: u64,
-    data: &[u8],
-    out: &mut Vec<u8>,
-) {
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub fn encode_article(msgid: &str, name: &str, file_size: u64, part: u32, total: u32, begin: u64, data: &[u8], out: &mut Vec<u8>) {
     use std::io::Write;
     let _ = write!(out, "222 0 {msgid}\r\n");
     let _ = write!(out, "=ybegin part={part} total={total} line=128 size={file_size} name={name}\r\n");

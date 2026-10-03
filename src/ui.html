@@ -502,7 +502,6 @@ function render() {
     if (![...lim.options].some(o => o.value === want)) { const o = el("option", "", Math.round(S.lim / 1048576) + " MB/s"); o.value = want; lim.appendChild(o); }
     if (lim.value !== want) lim.value = want;
   }
-  // Cards.
   txt($("#cq"), nq + " job" + (nq === 1 ? "" : "s"));
   txt($("#cq2"), fbytes(S.q[2]) + " left · ETA " + (S.q[3] ? fdur(S.q[3]) : "–") + " · " + nact + " active");
   const [res, lim2, free] = S.st;

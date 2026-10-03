@@ -8,7 +8,7 @@
 
 use crate::config::ServerCfg;
 use crate::conn::{self, ConnCtx, SStats};
-use crate::job::{self, Job, JobResult};
+use crate::job::{self, Job, JobResult, OnFinish};
 use crate::nzb;
 use crate::outfile;
 use crate::queue::Queues;
@@ -186,7 +186,7 @@ pub struct Engine {
     pub store: Mutex<Store>,
     kick: Arc<Kick>,
     done_rx: Mutex<mpsc::Receiver<Done>>,
-    finished: Arc<dyn Fn(&Job, JobResult) + Send + Sync>,
+    finished: OnFinish,
     move_tx: Mutex<mpsc::Sender<MoveTask>>,
     pub paused: AtomicBool,
     pub queue_ver: AtomicU64,
@@ -301,11 +301,8 @@ impl Engine {
         // Jobs that were being moved resume their move (their files are complete in
         // staging); other work left in staging is restarted from scratch.
         let hist: Vec<Hist> = fs::read(cfg.state_dir.join("history.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        let resumable: std::collections::HashSet<String> = hist
-            .iter()
-            .filter(|h| h.status == "Moving" && cfg.staging_dir.join(&h.m.nzo).is_dir())
-            .map(|h| h.m.nzo.clone())
-            .collect();
+        let resumable: std::collections::HashSet<String> =
+            hist.iter().filter(|h| h.status == "Moving" && cfg.staging_dir.join(&h.m.nzo).is_dir()).map(|h| h.m.nzo.clone()).collect();
         if let Ok(rd) = fs::read_dir(&cfg.staging_dir) {
             for e in rd.flatten() {
                 let n = e.file_name().to_string_lossy().into_owned();
@@ -355,11 +352,10 @@ impl Engine {
             Arc::new(move |j: &Job, r: JobResult| {
                 let _ = tx.lock().unwrap().send(Done { id: j.id, ok: r.ok, parts: r.parts, downloaded: j.bytes_done.load(Relaxed) });
                 kick.notify();
-            }) as Arc<dyn Fn(&Job, JobResult) + Send + Sync>
+            }) as OnFinish
         };
         let (move_tx, move_rx) = mpsc::channel::<MoveTask>();
 
-        // Restore state.
         let qf: QueueFile = fs::read(cfg.state_dir.join("queue.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let daily = fs::read(cfg.state_dir.join("servers.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let mut queue: Vec<Entry> = vec![];
@@ -369,10 +365,6 @@ impl Engine {
             if h.status == "Completed" || h.status == "Failed" {
                 history.push_back(h);
             } else if resumable.contains(&h.m.nzo) {
-                // Partial copies under an older naming scheme are redone from staging.
-                if !h.tmp_dest.is_empty() && !h.tmp_dest.ends_with(&h.m.nzo) {
-                    let _ = fs::remove_dir_all(&h.tmp_dest);
-                }
                 resume.push(h.m.clone());
                 history.push_back(h);
             } else if h.status == "Moving" && !h.storage.is_empty() && Path::new(&h.storage).is_dir() {
@@ -437,12 +429,7 @@ impl Engine {
             eprintln!("resuming move of {}", m.name);
             eng.reserved.fetch_add(m.bytes, Relaxed);
             eng.move_backlog.fetch_add(m.bytes, Relaxed);
-            let _ = eng.move_tx.lock().unwrap().send(MoveTask {
-                nzo: m.nzo.clone(),
-                src: eng.cfg.staging_dir.join(&m.nzo),
-                reserved: m.bytes,
-                meta: m,
-            });
+            let _ = eng.move_tx.lock().unwrap().send(MoveTask { nzo: m.nzo.clone(), src: eng.cfg.staging_dir.join(&m.nzo), reserved: m.bytes, meta: m });
         }
         let e = eng.clone();
         std::thread::spawn(move || e.run_loop());
@@ -522,7 +509,6 @@ impl Engine {
         }
         // Some indexer feeds escape more than once, so titles arrive as
         // "Minions.&amp;.Monsters" or even "Asterix.&amp;amp;.Obelix".
-        let mut name = name;
         for _ in 0..3 {
             let u = nzb::xml_unescape(&name);
             if u == name {
@@ -727,9 +713,7 @@ impl Engine {
     /// `ids` may contain job ids or "all" / "failed" / "completed".
     pub fn delete_history(&self, ids: &[String], del_files: bool) -> Vec<String> {
         let want = |h: &Hist| {
-            ids.iter().any(|i| {
-                i == &h.m.nzo || i == "all" || (i == "failed" && h.status == "Failed") || (i == "completed" && h.status == "Completed")
-            })
+            ids.iter().any(|i| i == &h.m.nzo || i == "all" || (i == "failed" && h.status == "Failed") || (i == "completed" && h.status == "Completed"))
         };
         let mut st = self.store.lock().unwrap();
         let mut removed = vec![];
@@ -774,7 +758,9 @@ impl Engine {
     /// Re-queues a failed job. Returns false if it is unknown or its NZB is gone.
     pub fn retry(&self, nzo: &str) -> bool {
         let mut st = self.store.lock().unwrap();
-        let Some(i) = st.history.iter().position(|h| h.m.nzo == nzo && h.status == "Failed") else { return false };
+        let Some(i) = st.history.iter().position(|h| h.m.nzo == nzo && h.status == "Failed") else {
+            return false;
+        };
         if !self.nzb_path(nzo).exists() {
             return false;
         }
@@ -875,7 +861,9 @@ impl Engine {
                     return;
                 }
                 let eligible = |e: &Entry| e.run.is_none() && !e.loading && !e.m.paused;
-                let Some(head) = st.queue.iter().position(eligible) else { return };
+                let Some(head) = st.queue.iter().position(eligible) else {
+                    return;
+                };
                 // Always allow one job, even if it alone exceeds the budget.
                 let busy = active > 0 || self.moving.load(Relaxed) > 0;
                 let reserved = self.reserved.load(Relaxed);
@@ -913,7 +901,9 @@ impl Engine {
             };
             let parsed = nzb::load(&self.nzb_path(&nzo).to_string_lossy());
             let mut st = self.store.lock().unwrap();
-            let Some(i) = st.queue.iter().position(|e| e.m.nzo == nzo) else { continue };
+            let Some(i) = st.queue.iter().position(|e| e.m.nzo == nzo) else {
+                continue;
+            };
             st.queue[i].loading = false;
             match parsed {
                 Ok(mut n) => {
@@ -959,7 +949,6 @@ impl Engine {
         }
     }
 
-    /// Picks `<cat dir>/<name>`, adding .1, .2, ... if taken.
     /// Picks and claims `<cat dir>/<name>`, adding .1, .2, ... if taken. Runs on a
     /// mover thread: these lookups can be slow on a busy NFS mount.
     fn unique_dest(&self, m: &Meta) -> PathBuf {
@@ -990,7 +979,9 @@ impl Engine {
                 self.reserved.fetch_sub(reserved, Relaxed);
                 continue;
             }
-            let Some(pos) = st.queue.iter().position(|e| e.run.as_ref().is_some_and(|r| r.job.id == d.id)) else { continue };
+            let Some(pos) = st.queue.iter().position(|e| e.run.as_ref().is_some_and(|r| r.job.id == d.id)) else {
+                continue;
+            };
             let e = st.queue.remove(pos);
             let run = e.run.expect("running");
             let mut h = Hist {
@@ -1008,7 +999,8 @@ impl Engine {
             let mut cleanup = vec![];
             if d.ok {
                 self.move_backlog.fetch_add(run.reserved, Relaxed);
-                let _ = self.move_tx.lock().unwrap().send(MoveTask { nzo: h.m.nzo.clone(), src: run.job.work.clone(), meta: h.m.clone(), reserved: run.reserved });
+                let _ =
+                    self.move_tx.lock().unwrap().send(MoveTask { nzo: h.m.nzo.clone(), src: run.job.work.clone(), meta: h.m.clone(), reserved: run.reserved });
             } else {
                 h.fail_message = d.parts.first().cloned().unwrap_or_else(|| "failed".into());
                 self.jobs_failed.fetch_add(1, Relaxed);
@@ -1037,7 +1029,9 @@ impl Engine {
 
     fn mover(self: Arc<Self>, rx: Arc<Mutex<mpsc::Receiver<MoveTask>>>) {
         loop {
-            let Ok(t) = rx.lock().unwrap().recv() else { return };
+            let Ok(t) = rx.lock().unwrap().recv() else {
+                return;
+            };
             self.moving.fetch_add(1, Relaxed);
             let t0 = Instant::now();
             // The partial copy has a fixed name, so a move interrupted by a restart

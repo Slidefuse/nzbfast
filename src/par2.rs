@@ -48,7 +48,7 @@ impl Par2Set {
                 break;
             }
             let len = u64::from_le_bytes(data[s + 8..s + 16].try_into().unwrap()) as usize;
-            if len < 64 || len % 4 != 0 || s + len > data.len() {
+            if len < 64 || !len.is_multiple_of(4) || s + len > data.len() {
                 p = s + 8;
                 continue;
             }
@@ -69,18 +69,11 @@ impl Par2Set {
                     let fid = id(body);
                     let name_raw = &body[56..];
                     let name = String::from_utf8_lossy(name_raw.split(|&c| c == 0).next().unwrap_or(&[])).into_owned();
-                    self.files.insert(
-                        fid,
-                        FileDesc {
-                            md5_16k: id(&body[32..]),
-                            len: u64::from_le_bytes(body[48..56].try_into().unwrap()),
-                            name,
-                        },
-                    );
+                    self.files.insert(fid, FileDesc { md5_16k: id(&body[32..]), len: u64::from_le_bytes(body[48..56].try_into().unwrap()), name });
                 }
                 b"PAR 2.0\0IFSC\0\0\0\0" => {
                     let fid = id(body);
-                    let crcs = body[16..].chunks_exact(20).map(|c| u32::from_le_bytes(c[16..20].try_into().unwrap())).collect();
+                    let crcs = body[16..].as_chunks::<20>().0.iter().map(|c| u32::from_le_bytes(c[16..20].try_into().unwrap())).collect();
                     self.ifsc.insert(fid, crcs);
                 }
                 b"PAR 2.0\0RecvSlic" => {

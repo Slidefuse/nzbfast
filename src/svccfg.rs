@@ -27,6 +27,7 @@ pub struct SvcCfg {
     pub staging_limit_gb: f64,
     pub active_jobs: usize,
     pub depth: usize,
+    /// Network interface shown as "NIC" in the web UI (default: the busiest one).
     pub nic: String,
     pub io_threads: usize,
     /// RAM for complete output chunks waiting for disk, and for reusable buffers (MiB).
@@ -61,7 +62,7 @@ impl Default for SvcCfg {
             staging_limit_gb: 32.0,
             active_jobs: 256,
             depth: 8,
-            nic: "eth0".into(),
+            nic: String::new(),
             io_threads: 8,
             write_buffer_mb: 0,
             mover_jobs: 2,
@@ -252,5 +253,34 @@ pub fn load(path: &str) -> Result<Loaded, String> {
     if cfg.complete_dir.is_empty() {
         return Err("complete_dir is not set (and not found in sab_ini)".into());
     }
+    if cfg.nic.is_empty() {
+        cfg.nic = busiest_nic();
+    }
     Ok(Loaded { cfg, servers, categories })
+}
+
+/// The network interface (other than loopback) that has received the most data.
+fn busiest_nic() -> String {
+    let rx = |n: &str| std::fs::read_to_string(format!("/sys/class/net/{n}/statistics/rx_bytes")).ok().and_then(|s| s.trim().parse::<u64>().ok());
+    std::fs::read_dir("/sys/class/net")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n != "lo")
+        .filter_map(|n| rx(&n).map(|b| (b, n)))
+        .max()
+        .map(|(_, n)| n)
+        .unwrap_or_else(|| "lo".into())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn example_config_loads() {
+        let p = concat!(env!("CARGO_MANIFEST_DIR"), "/deploy/nzbfast.example.toml");
+        let l = super::load(p).unwrap();
+        assert_eq!(l.servers.len(), 1);
+        assert!(l.categories.iter().any(|c| c.name == "tv"));
+    }
 }

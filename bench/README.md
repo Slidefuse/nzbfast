@@ -1,39 +1,65 @@
-# Benchmark harness
+# Benchmarks
 
-Reproduces the comparison in [docs/BENCHMARKS.md](../docs/BENCHMARKS.md): nzbfast, SABnzbd and
-NZBGet download the same corpus from the same in-RAM TLS NNTP server (`nzbfast mock-serve`), and
-every output is checked against reference MD5s.
+Reproduces [docs/BENCHMARKS.md](../docs/BENCHMARKS.md): nzbfast, SABnzbd and NZBGet
+download the same corpus from the same in-RAM NNTP test server, every output is
+checked against reference MD5s, and `plot.py` draws the graphs.
 
-Layout (override the root with `BENCH_ROOT`; the shell scripts assume `/root/bench`):
+## Setup
 
-```
-$BENCH_ROOT/bin/        nzbfast (release build), par2 (par2cmdline-turbo), rar
-$BENCH_ROOT/SABnzbd-5.1.3/  + sabvenv/ (pip install -r requirements.txt)
-$BENCH_ROOT/nzbget/     NZBGet 26.3 (nzbget-26.3-bin-linux.run --destdir)
-$BENCH_ROOT/cfg/        sab.ini.tmpl, nzbfast.toml, nzbget.conf.tmpl (sed -f cfg/nzbget.sed on the stock nzbget.conf)
-$BENCH_ROOT/corpus/     made by mkcorpus.sh (71 GB; staging in /dev/shm)
-$BENCH_ROOT/mock/       nzbfast mock-gen --out mock corpus/*  (then add the password meta to Enc.E01's NZB)
-```
-
-Run:
+Everything lives under `$BENCH_ROOT` (default `/root/bench`; the clients' configs use
+`/dev/shm/b` for their folders). You need about 80 GB of RAM for the test server and
+70 GB of tmpfs for the downloads, 16 vCPUs (clients on 0-9, server on 10-15), Python 3
+with matplotlib, and root (the harness drops page caches; `rtt` uses `tc netem`).
 
 ```
-taskset -c 10-15 nzbfast mock-serve --dir mock --port 5563 --tls \
-  --drop "Repair.R01.1080p-BENCH.:33" --drop "Repair.R02.1080p-BENCH.3.:0" \
-  --drop "Repair.R03.1080p-BENCH.:50" --drop "Dead.D01.1080p-BENCH.:4"
-./mock.sh        # (re)start the mock server with the drop rules above
-./runall.sh      # movies, tv, pp, repair x {nzbfast, sab, nzbget} x {default, tuned} x 3
-./extras.sh      # isolated repair/dead, 4 vCPU, 30/100 ms RTT (tc netem on lo)
-./extras2.sh     # the same scenarios for NZBGet tuned
-./nfv2.sh        # nzbfast only, every scenario (used after the fixes)
-./realrun.sh     # live providers: NZBs in $BENCH_ROOT/real, provider configs in $BENCH_ROOT/prov
+$BENCH_ROOT/bin/          nzbfast, nntp-mock (cargo build --release -p nzbfast -p nntp-mock),
+                          rar, par2 (par2cmdline-turbo), plus 7z on PATH
+$BENCH_ROOT/SABnzbd-5.1.3/  SABnzbd source, with its venv in $BENCH_ROOT/sabvenv
+$BENCH_ROOT/nzbget/       NZBGet 26.3 (nzbget-26.3-bin-linux.run --destdir)
+$BENCH_ROOT/cfg/          nzbfast.toml, sab.ini.tmpl and nzbget.conf.tmpl, made with
+                          sed "s|BENCH_ROOT|$BENCH_ROOT|" cfg/nzbget.sed | sed -f - nzbget/nzbget.conf
 ```
 
-Live providers need `$BENCH_ROOT/prov/{nzbfast-servers.toml,sab-servers.ini,nzbget-servers.conf}`
-(server blocks for each client; keep them mode 600). If a production instance shares the
-accounts, pause it around runs (see `prod.sh.example`): shared connection limits and relay
-traffic otherwise skew results.
+Then build the corpus (71 GB of releases, encoded into 73 GB of articles):
 
-One run: `taskset -c 0-9 python3 harness.py CLIENT SUITE TAG [--variant default|tuned]`.
-Results land in `$BENCH_ROOT/results/SUITE.CLIENT.VARIANT.TAG.json` (wall time, CPU, memory,
-per-job status and MD5 check, 0.5 s throughput series, API latencies).
+```
+./mkcorpus.sh
+```
+
+## Running
+
+```
+./run.sh mock        # start the test server (keep it running)
+./run.sh core        # movies, tv, pp, repair: every client and variant, 3 runs each
+./run.sh providers   # provider scenarios, each client's faster variant
+./run.sh small       # 4 vCPUs
+./run.sh rtt         # 30 and 100 ms round trips (tc netem on lo)
+python3 plot.py      # graphs into docs/img, tables on stdout
+```
+
+Each run is one fresh client: `harness.py CLIENT SUITE_OR_SCENARIO TAG [--variant
+default|tuned]` adds every NZB of the suite through the client's API, waits until all
+of them are in its history, verifies the output and writes
+`$BENCH_ROOT/results/SUITE.CLIENT.VARIANT.TAG.json` (wall time, CPU, memory, per-job
+results, a 0.5 s throughput series, bytes served per test-server port and API latency).
+
+`run.sh real` runs the NZBs in `$BENCH_ROOT/real` against real providers, with server
+blocks for each client in `$BENCH_ROOT/prov/{nzbfast-servers.toml,sab-servers.ini,nzbget-servers.conf}`
+(keep them mode 600). Other users of the same accounts skew the results, since
+connection limits are shared.
+
+## The test server
+
+`nntp-mock serve` holds every article in RAM and answers `BODY`/`STAT` with pipelining
+over TLS. Each `--listen` port behaves like a different provider:
+
+| Port | Behaviour |
+| --- | --- |
+| 5563 | Everything, except the damaged releases' missing articles |
+| 5570 | Everything (backup provider) |
+| 5571 | Half the TV episodes taken down; "430 not found" takes 500 ms |
+| 5572 | 2 MB/s per connection |
+| 5573 | At most 20 connections; more get "502 too many connections" |
+| 5574 | Accepts connections but stalls the login for 60 s |
+| 5575 | Drops the connection mid-article every 50 articles; 412 for 2.5% of articles |
+| 5576 | Refuses and drops all connections from 1 s to 6 s into each run |

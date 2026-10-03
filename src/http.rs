@@ -95,15 +95,13 @@ pub fn url_decode(s: &str) -> String {
     while i < b.len() {
         match b[i] {
             b'+' => out.push(b' '),
-            b'%' if i + 2 < b.len() => {
-                match u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16) {
-                    Ok(v) => {
-                        out.push(v);
-                        i += 2;
-                    }
-                    Err(_) => out.push(b'%'),
+            b'%' if i + 2 < b.len() => match u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16) {
+                Ok(v) => {
+                    out.push(v);
+                    i += 2;
                 }
-            }
+                Err(_) => out.push(b'%'),
+            },
             c => out.push(c),
         }
         i += 1;
@@ -140,22 +138,30 @@ fn disposition_param(h: &str, key: &str) -> Option<String> {
 
 /// Parses a multipart/form-data body.
 pub fn multipart(body: &[u8], ctype: &str) -> Vec<Part> {
-    let Some(b) = ctype.split(';').filter_map(|p| p.trim().strip_prefix("boundary=")).next() else { return vec![] };
+    let Some(b) = ctype.split(';').filter_map(|p| p.trim().strip_prefix("boundary=")).next() else {
+        return vec![];
+    };
     let b = b.trim_matches('"');
     let delim = format!("--{b}");
     let next_delim = format!("\r\n--{b}");
     let fin = memchr::memmem::Finder::new(next_delim.as_bytes());
-    let Some(mut pos) = memchr::memmem::find(body, delim.as_bytes()).map(|p| p + delim.len()) else { return vec![] };
+    let Some(mut pos) = memchr::memmem::find(body, delim.as_bytes()).map(|p| p + delim.len()) else {
+        return vec![];
+    };
     let mut parts = vec![];
     loop {
         if body[pos..].starts_with(b"--") {
             break;
         }
         // Skip the CRLF after the delimiter.
-        let Some(he) = memchr::memmem::find(&body[pos..], b"\r\n\r\n") else { break };
+        let Some(he) = memchr::memmem::find(&body[pos..], b"\r\n\r\n") else {
+            break;
+        };
         let head = String::from_utf8_lossy(&body[pos..pos + he]).into_owned();
         let ds = pos + he + 4;
-        let Some(de) = fin.find(&body[ds..]).map(|e| ds + e) else { break };
+        let Some(de) = fin.find(&body[ds..]).map(|e| ds + e) else {
+            break;
+        };
         let mut name = String::new();
         let mut filename = None;
         for line in head.split("\r\n") {
@@ -281,10 +287,8 @@ fn connection(mut s: TcpStream, h: &Handler) -> io::Result<()> {
         let rl = lines.next().unwrap_or("");
         let mut it = rl.split(' ');
         let (method, target, version) = (it.next().unwrap_or(""), it.next().unwrap_or("/"), it.next().unwrap_or("HTTP/1.0"));
-        let headers: Vec<(String, String)> = lines
-            .filter_map(|l| l.split_once(':'))
-            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
-            .collect();
+        let headers: Vec<(String, String)> =
+            lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string())).collect();
         let hv = |n: &str| headers.iter().find(|(k, _)| k == n).map(|(_, v)| v.to_ascii_lowercase());
         if hv("expect").is_some_and(|v| v == "100-continue") {
             s.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;

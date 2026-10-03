@@ -57,7 +57,8 @@ pub struct JobRoute {
     /// Items handed to each server, and those settled (answered or given back).
     issued: [AtomicU32; 64],
     settled: [AtomicU32; 64],
-    sample: AtomicU32,
+    /// Items routed past each server since the job started skipping it.
+    passed: [AtomicU32; 64],
 }
 
 /// A server is skipped for a job once at least SKIP_MIN answers are in and half or more
@@ -69,18 +70,24 @@ const SKIP_WINDOW: u32 = 32;
 /// Until a server has answered SKIP_MIN items of a job, at most this many of them may be
 /// in flight there, so a server lacking the job does not fill every connection's
 /// pipeline with it before the job has learned to skip it.
-const PROBE_INFLIGHT: u32 = 16;
+const PROBE_INFLIGHT: u32 = SKIP_MIN;
 
 impl Default for JobRoute {
     fn default() -> Self {
         let z = || std::array::from_fn(|_| AtomicU32::new(0));
-        JobRoute { recent: std::array::from_fn(|_| AtomicU64::new(0)), answers: z(), issued: z(), settled: z(), sample: AtomicU32::new(0) }
+        JobRoute { recent: std::array::from_fn(|_| AtomicU64::new(0)), answers: z(), issued: z(), settled: z(), passed: z() }
     }
 }
 
 impl JobRoute {
     pub fn record(&self, server: usize, hit: bool) {
         self.settle(server);
+        if hit && self.lacks(server) {
+            // A server this job was skipping has it after all (e.g. a later file): learn anew.
+            self.recent[server].store(0, Relaxed);
+            self.answers[server].store(0, Relaxed);
+            self.passed[server].store(0, Relaxed);
+        }
         let _ = self.recent[server].fetch_update(Relaxed, Relaxed, |r| Some(r << 1 | !hit as u64));
         let a = &self.answers[server];
         if a.load(Relaxed) < 64 {
@@ -118,10 +125,15 @@ impl JobRoute {
         (self.settled[server].load(Relaxed) < SKIP_MIN && inflight >= PROBE_INFLIGHT) || soft.is_some_and(|l| inflight >= l)
     }
 
-    /// The server lacks much of what it was recently asked for this job; 1 in 16 is
-    /// still asked so a change (e.g. a later file that it does have) is noticed.
+    /// The server lacks much of what it was recently asked for this job. Ever fewer items
+    /// are still sent there (the 16th, 32nd, 64th... skipped one, then every 1024th): each
+    /// costs a "not found" that can take a second and holds up a pipelined connection.
     fn skips(&self, server: usize) -> bool {
-        self.lacks(server) && self.sample.fetch_add(1, Relaxed) % 16 != 0
+        if !self.lacks(server) {
+            return false;
+        }
+        let n = self.passed[server].fetch_add(1, Relaxed) + 1;
+        !(n >= 16 && (n.is_power_of_two() || n.is_multiple_of(1024)))
     }
 
     fn lacks(&self, server: usize) -> bool {
@@ -232,6 +244,8 @@ struct Health {
     suspect: AtomicBool,
     /// `now_ms()` of the first login attempt that is still pending; 0 once one succeeds.
     connecting_since: AtomicU64,
+    /// `now_ms()` before which no thread probes the server while it is down.
+    next_probe: AtomicU64,
 }
 
 impl Health {
@@ -245,7 +259,7 @@ impl Health {
 
     /// Never fills gaps left by other servers; still sampled 1 in 32 to notice change.
     fn useless_for_retry(&self) -> bool {
-        self.retry_rate() < 0.01 && self.sample.fetch_add(1, Relaxed) % 32 != 0
+        self.retry_rate() < 0.01 && !self.sample.fetch_add(1, Relaxed).is_multiple_of(32)
     }
 }
 
@@ -345,6 +359,16 @@ impl Queues {
         }
     }
 
+    /// Claims the next reachability probe of a down server: one per second for the first
+    /// minute (short outages end quickly), then one every ten seconds.
+    pub fn claim_probe(&self, server: usize) -> bool {
+        let h = &self.health[server];
+        let now = now_ms();
+        let next = h.next_probe.load(Relaxed);
+        let every = if self.down_for(server).unwrap_or(0) < 60_000 { 1000 } else { 10_000 };
+        now >= next && h.next_probe.compare_exchange(next, now + every, Relaxed, Relaxed).is_ok()
+    }
+
     /// Marks a server unreachable (or reachable again).
     pub fn set_down(&self, server: usize, down: bool) {
         let h = &self.health[server].down_since;
@@ -366,14 +390,11 @@ impl Queues {
         if self.prio[server] != up_prio {
             return false;
         }
-        let best = (0..self.prio.len())
-            .filter(|&s| self.prio[s] == up_prio && !self.is_down(s))
-            .map(|s| self.health[s].rate())
-            .fold(0.0, f64::max);
+        let best = (0..self.prio.len()).filter(|&s| self.prio[s] == up_prio && !self.is_down(s)).map(|s| self.health[s].rate()).fold(0.0, f64::max);
         let h = &self.health[server];
         // Miss latency is reported but not used: on long links the gap between
         // responses is dominated by transfer time, not by the server's lookup.
-        h.rate() >= 0.5 * best || h.sample.fetch_add(1, Relaxed) % 32 == 0
+        h.rate() >= 0.5 * best || h.sample.fetch_add(1, Relaxed).is_multiple_of(32)
     }
 
     pub fn push_back(&self, items: impl IntoIterator<Item = Work>) {
@@ -433,9 +454,8 @@ impl Queues {
     /// server while all of them are down. `None` means the article is missing.
     fn route(&self, w: &Work) -> Option<usize> {
         let untried = |s: &usize| w.tried & (1u64 << s) == 0;
-        let best_up = (0..self.prio.len())
-            .filter(|s| untried(s) && !self.is_down(*s) && !self.unproven(*s) && !self.health[*s].useless_for_retry())
-            .min_by(|&a, &b| {
+        let best_up =
+            (0..self.prio.len()).filter(|s| untried(s) && !self.is_down(*s) && !self.unproven(*s) && !self.health[*s].useless_for_retry()).min_by(|&a, &b| {
                 let (ra, rb) = (self.health[a].retry_rate(), self.health[b].retry_rate());
                 let lacks = |s: usize| w.job.route.lacks(s);
                 self.prio[a].cmp(&self.prio[b]).then(lacks(a).cmp(&lacks(b))).then(rb.partial_cmp(&ra).unwrap())
@@ -551,7 +571,7 @@ impl Queues {
                         // Only jobs this server may not take more of right now: look
                         // again soon (answers free their share without a wakeup).
                         None if !q.main.is_empty() => {
-                            let Some(d) = deadline else { return None };
+                            let d = deadline?;
                             let now = Instant::now();
                             if now >= d {
                                 return None;

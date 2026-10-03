@@ -181,7 +181,14 @@ pub fn run(l: Loaded, sab_url: &str, incomplete: &Path, dry_run: bool) -> Result
         eprintln!("  note: {busy} SABnzbd jobs are still post-processing and were not imported (let them finish first)");
     }
     let total: u64 = metas.iter().map(|m| m.bytes).sum();
-    eprintln!("importing {} queued jobs ({:.2} TB), {} history entries, {} skipped{}", metas.len(), total as f64 / 1e12, hists.len(), skipped.len(), if dry_run { " [dry run]" } else { "" });
+    eprintln!(
+        "importing {} queued jobs ({:.2} TB), {} history entries, {} skipped{}",
+        metas.len(),
+        total as f64 / 1e12,
+        hists.len(),
+        skipped.len(),
+        if dry_run { " [dry run]" } else { "" }
+    );
     if dry_run {
         return Ok(());
     }

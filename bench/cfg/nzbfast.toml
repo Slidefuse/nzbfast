@@ -7,16 +7,6 @@ staging_limit_gb = 150
 nic = "lo"
 ui_auth = false
 
-[[servers]]
-name = "mock"
-host = "127.0.0.1"
-port = 5563
-tls = true
-insecure = true
-user = "bench"
-pass = "bench"
-conns = 50
-
 [[categories]]
 name = "bench"
 dir = "bench"

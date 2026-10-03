@@ -134,20 +134,18 @@ pub fn mul_add_t(dst: &mut [u8], src: &[u8], t: &MulTable) {
         }
         _ => {}
     }
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    let done = unsafe { mul_add_avx2(dst, src, t) };
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    #[cfg(target_arch = "x86_64")]
+    let done = if is_x86_feature_detected!("avx2") { unsafe { mul_add_avx2(dst, src, t) } } else { 0 };
+    #[cfg(not(target_arch = "x86_64"))]
     let done = 0;
-    for (dw, sw) in dst[done..].chunks_exact_mut(2).zip(src[done..].chunks_exact(2)) {
-        let p = t.word(u16::from_le_bytes([sw[0], sw[1]]));
-        let cur = u16::from_le_bytes([dw[0], dw[1]]) ^ p;
-        dw.copy_from_slice(&cur.to_le_bytes());
+    for (dw, sw) in dst[done..].as_chunks_mut::<2>().0.iter_mut().zip(src[done..].as_chunks::<2>().0) {
+        *dw = (u16::from_le_bytes(*dw) ^ t.word(u16::from_le_bytes(*sw))).to_le_bytes();
     }
 }
 
 /// 64 bytes (32 words) per step: split words into low/high byte vectors, look up each
 /// nibble with `vpshufb`, then re-interleave the product bytes. Returns bytes processed.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn mul_add_avx2(dst: &mut [u8], src: &[u8], t: &MulTable) -> usize {
     use std::arch::x86_64::*;
@@ -189,7 +187,7 @@ unsafe fn mul_add_avx2(dst: &mut [u8], src: &[u8], t: &MulTable) -> usize {
     n
 }
 
-/// Inverts a k×k matrix in place (row-major). Returns false if singular.
+/// Inverts a k×k matrix (row-major; `m` is destroyed). `None` if singular.
 pub fn invert(m: &mut [u16], k: usize) -> Option<Vec<u16>> {
     let mut inv = vec![0u16; k * k];
     for i in 0..k {
@@ -247,10 +245,8 @@ mod tests {
                 let src: Vec<u8> = (0..len).map(|_| rnd() as u8).collect();
                 let dst0: Vec<u8> = (0..len).map(|_| rnd() as u8).collect();
                 let mut want = dst0.clone();
-                for (d, s) in want.chunks_exact_mut(2).zip(src.chunks_exact(2)) {
-                    let p = mul(c, u16::from_le_bytes([s[0], s[1]]));
-                    let v = u16::from_le_bytes([d[0], d[1]]) ^ p;
-                    d.copy_from_slice(&v.to_le_bytes());
+                for (d, s) in want.as_chunks_mut::<2>().0.iter_mut().zip(src.as_chunks::<2>().0) {
+                    *d = (u16::from_le_bytes(*d) ^ mul(c, u16::from_le_bytes(*s))).to_le_bytes();
                 }
                 let mut got = dst0.clone();
                 mul_add(&mut got, &src, c);

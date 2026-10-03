@@ -175,13 +175,7 @@ impl OutFile {
                 let mut m = self.chunks.lock().unwrap();
                 m.entry(idx)
                     .or_insert_with(|| {
-                        Arc::new(Chunk {
-                            idx,
-                            len: self.chunk_len(idx),
-                            buf: get_buf(),
-                            filled: AtomicU64::new(0),
-                            submitted: AtomicBool::new(false),
-                        })
+                        Arc::new(Chunk { idx, len: self.chunk_len(idx), buf: get_buf(), filled: AtomicU64::new(0), submitted: AtomicBool::new(false) })
                     })
                     .clone()
             };
@@ -205,11 +199,7 @@ impl OutFile {
         let io = IO.get().expect("io pool");
         // O_DIRECT writes run in parallel; buffered writes to one file serialize on the
         // inode lock anyway, so keep each file on one I/O thread.
-        let i = if self.direct {
-            io.rr.fetch_add(1, Relaxed) % io.txs.len()
-        } else {
-            (Arc::as_ptr(self) as usize >> 6) % io.txs.len()
-        };
+        let i = if self.direct { io.rr.fetch_add(1, Relaxed) % io.txs.len() } else { (Arc::as_ptr(self) as usize >> 6) % io.txs.len() };
         let _ = io.txs[i].send(IoReq { out: self.clone(), chunk: ch, owner: owner.clone() });
     }
 
@@ -238,7 +228,7 @@ impl OutFile {
 
     /// Trims O_DIRECT padding past the real end of file.
     pub fn finish(&self) {
-        if self.direct && self.size % ALIGN as u64 != 0 {
+        if self.direct && !self.size.is_multiple_of(ALIGN as u64) {
             let _ = self.file.set_len(self.size);
         }
         let _ = self.file.sync_data();
