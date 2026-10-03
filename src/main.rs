@@ -33,7 +33,7 @@ fn usage() -> ! {
   nzbfast get [--sab-ini FILE] [--server SPEC]... [--only a,b] [--tmp DIR] [--done DIR]
               [--active N] [--depth N] [--nic IF] [--limit N] NZB|DIR...
   nzbfast mock-gen --out DIR RELEASE_DIR...
-  nzbfast mock-serve --dir DIR [--port P] [--tls]
+  nzbfast mock-serve --dir DIR [--port P] [--tls] [--drop SUBSTR:EVERY[:CODE]]... [--miss-ms N] [--conn-mbs N]
   nzbfast bench"
     );
     std::process::exit(2)
@@ -104,7 +104,7 @@ fn main() {
             mock::gen(Path::new(&out.unwrap_or_else(|| usage())), &rels).unwrap();
         }
         "mock-serve" => {
-            let (mut dir, mut port, mut tls) = (None, 1119u16, false);
+            let (mut dir, mut port, mut tls, mut miss_ms, mut conn_mbs) = (None, 1119u16, false, 0, 0);
             let mut drops = vec![];
             let mut it = rest.iter();
             while let Some(a) = it.next() {
@@ -113,10 +113,12 @@ fn main() {
                     "--port" => port = it.next().unwrap().parse().unwrap(),
                     "--tls" => tls = true,
                     "--drop" => drops.push(it.next().unwrap().clone()),
+                    "--miss-ms" => miss_ms = it.next().unwrap().parse().unwrap(),
+                    "--conn-mbs" => conn_mbs = it.next().unwrap().parse().unwrap(),
                     _ => usage(),
                 }
             }
-            mock::serve(Path::new(&dir.unwrap_or_else(|| usage())), port, tls, &drops).unwrap();
+            mock::serve(Path::new(&dir.unwrap_or_else(|| usage())), port, tls, &drops, miss_ms, conn_mbs).unwrap();
         }
         "bench" => bench(),
         "fetch" => {
@@ -325,7 +327,8 @@ fn get(args: &[String]) {
     std::fs::create_dir_all(&done).unwrap();
 
     outfile::start_io(8);
-    let q = Arc::new(Queues::new(servers.iter().map(|s| s.priority).collect()));
+    let slots = servers.iter().map(|s| (s.conns * if s.depth > 0 { s.depth } else { depth }) as u32).collect();
+    let q = Arc::new(Queues::new(servers.iter().map(|s| s.priority).collect(), slots));
     let _ = job::QUEUE.set(q.clone());
     let stats: Vec<Arc<SStats>> = servers.iter().map(|_| Arc::new(SStats::default())).collect();
     let mut total_conns = 0;
@@ -381,7 +384,7 @@ fn get(args: &[String]) {
                 std::thread::sleep(Duration::from_secs(1));
                 sec += 1;
                 for w in q.sweep() {
-                    w.job.on_missing(w.file, w.seg, &q);
+                    w.missing(&q);
                 }
                 let mut tot = 0u64;
                 let mut parts = String::new();
@@ -427,7 +430,7 @@ fn get(args: &[String]) {
     };
     while next < n_inputs || active.load(Relaxed) > 0 {
         printer(&rx);
-        if next < n_inputs && active.load(Relaxed) < active_max && q.len() < low_water {
+        if next < n_inputs && active.load(Relaxed) < active_max && q.main_len() < low_water {
             let path = inputs[next].to_string_lossy().to_string();
             next += 1;
             match nzb::load(&path) {

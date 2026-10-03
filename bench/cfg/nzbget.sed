@@ -1,0 +1,27 @@
+# Applied to the stock nzbget.conf shipped with NZBGet 26.3: sed -f nzbget.sed nzbget.conf > nzbget.conf.tmpl
+s|^MainDir=.*|MainDir=/dev/shm/b/ng|
+s|^DestDir=.*|DestDir=/dev/shm/b/ng/done|
+s|^InterDir=.*|InterDir=/dev/shm/b/ng/inc|
+s|^WebDir=.*|WebDir=/root/bench/nzbget/webui|
+s|^ScriptDir=.*|ScriptDir=/root/bench/nzbget/scripts|
+s|^ConfigTemplate=.*|ConfigTemplate=/root/bench/nzbget/webui/nzbget.conf.template|
+s|^CertStore=.*|CertStore=/root/bench/nzbget/cacert.pem|
+s|^Server1\.Name=.*|Server1.Name=mock|
+s|^Server1\.Host=.*|Server1.Host=127.0.0.1|
+s|^Server1\.Port=.*|Server1.Port=5563|
+s|^Server1\.Username=.*|Server1.Username=bench|
+s|^Server1\.Password=.*|Server1.Password=bench|
+s|^Server1\.Connections=.*|Server1.Connections=50|
+s|^Server1\.CertVerification=.*|Server1.CertVerification=none|
+s|^ControlIP=.*|ControlIP=127.0.0.1|
+s|^ControlPort=.*|ControlPort=16789|
+s|^ControlUsername=.*|ControlUsername=bench|
+s|^ControlPassword=.*|ControlPassword=bench|
+s|^CertCheck=.*|CertCheck=no|
+s|^Category1\.Name=.*|Category1.Name=bench|
+s|^NzbDirInterval=.*|NzbDirInterval=0|
+s|^DupeCheck=.*|DupeCheck=no|
+s|^DiskSpace=.*|DiskSpace=0|
+s|^OutputMode=.*|OutputMode=loggable|
+s|^UnrarCmd=.*|UnrarCmd=/root/bench/nzbget/unrar|
+s|^SevenZipCmd=.*|SevenZipCmd=/root/bench/nzbget/7za|

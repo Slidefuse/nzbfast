@@ -18,7 +18,7 @@ use crate::gf16;
 use crate::nzb::{subject_filename, Nzb, NzbSeg};
 use crate::outfile::{IoOwner, OutFile};
 use crate::par2::{self, Par2Set};
-use crate::queue::{Queues, Work};
+use crate::queue::{JobRoute, Queues, Work};
 use crate::rar::{self, RarVol};
 use crate::yenc::YInfo;
 use std::collections::HashMap;
@@ -141,6 +141,13 @@ pub struct Job {
     aborted: AtomicBool,
     missing_bytes: AtomicU64,
     recoverable: AtomicU64,
+    /// STAT availability sample: articles asked, still unanswered, answered (known), and
+    /// found missing; plus the data bytes (non-par2) the sample stands for.
+    sample_n: AtomicUsize,
+    sample_left: AtomicUsize,
+    sample_known: AtomicUsize,
+    sample_missing: AtomicUsize,
+    want_bytes: AtomicU64,
     pub bytes_total: u64,
     pub bytes_done: AtomicU64,
     /// Progress in NZB (encoded) bytes: segments handled (downloaded or given up on)
@@ -152,6 +159,12 @@ pub struct Job {
     cancelled: AtomicBool,
     /// `Some` while paused: work items held back from the queue.
     parked: Mutex<Option<Vec<Work>>>,
+    /// Which servers have this job's articles.
+    pub route: JobRoute,
+    /// Staging granted to this job: bytes of first attempts it may take from the main
+    /// queue (`u64::MAX` = all), and how many it has taken.
+    pub grant: AtomicU64,
+    pub taken: AtomicU64,
     pub started: Instant,
     pub finished: Arc<dyn Fn(&Job, JobResult) + Send + Sync>,
 }
@@ -173,6 +186,13 @@ enum VSrc {
     Out { out: usize, len: u64 },
     Vol { vol: usize },
 }
+
+/// Availability sample: every SAMPLE_EVERY-th article of each data file is checked with
+/// STAT first (when that yields at least SAMPLE_MIN items); a job is aborted early only if
+/// at least SAMPLE_MIN_MISSING are gone and the projected loss exceeds 2x the recovery.
+const SAMPLE_EVERY: usize = 25;
+const SAMPLE_MIN: usize = 40;
+const SAMPLE_MIN_MISSING: u64 = 5;
 
 fn is_par2_name(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with(".par2")
@@ -201,6 +221,28 @@ const VIDEO_EXT: &[&str] = &["mkv", "mp4", "avi", "m4v", "ts", "m2ts", "wmv", "m
 fn is_video(name: &str) -> bool {
     let l = name.to_ascii_lowercase();
     VIDEO_EXT.iter().any(|e| l.ends_with(&format!(".{e}")))
+}
+
+/// Video container from a file's first bytes, for posts whose names drop the extension
+/// (Radarr/Sonarr only import files with a video extension).
+fn video_magic(d: &[u8]) -> Option<&'static str> {
+    if d.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        Some("mkv")
+    } else if d.len() >= 12 && &d[4..8] == b"ftyp" {
+        Some(if &d[8..12] == b"qt  " { "mov" } else { "mp4" })
+    } else if d.len() >= 12 && d.starts_with(b"RIFF") && &d[8..12] == b"AVI " {
+        Some("avi")
+    } else if d.starts_with(&[0x30, 0x26, 0xb2, 0x75, 0x8e, 0x66, 0xcf, 0x11]) {
+        Some("wmv")
+    } else if d.len() > 376 && d[0] == 0x47 && d[188] == 0x47 && d[376] == 0x47 {
+        Some("ts")
+    } else if d.len() > 388 && d[4] == 0x47 && d[196] == 0x47 && d[388] == 0x47 {
+        Some("m2ts")
+    } else if d.starts_with(&[0, 0, 1, 0xba]) {
+        Some("mpg")
+    } else {
+        None
+    }
 }
 
 /// Random-looking names (hashes, base62 blobs) carry no information for Plex/*arr.
@@ -365,6 +407,11 @@ impl Job {
             aborted: AtomicBool::new(false),
             missing_bytes: AtomicU64::new(0),
             recoverable: AtomicU64::new(recoverable),
+            sample_n: AtomicUsize::new(0),
+            sample_left: AtomicUsize::new(0),
+            sample_known: AtomicUsize::new(0),
+            sample_missing: AtomicUsize::new(0),
+            want_bytes: AtomicU64::new(0),
             bytes_total,
             bytes_done: AtomicU64::new(0),
             enc_total: AtomicU64::new(bytes_total),
@@ -373,6 +420,9 @@ impl Job {
             phase: AtomicU8::new(PH_PROBE),
             cancelled: AtomicBool::new(false),
             parked: Mutex::new(None),
+            route: JobRoute::default(),
+            grant: AtomicU64::new(u64::MAX),
+            taken: AtomicU64::new(0),
             started: Instant::now(),
             finished,
         })
@@ -417,7 +467,7 @@ impl Job {
             items.extend(v);
         }
         for w in items {
-            self.drop_work(w.file, w.seg, q);
+            w.dropped(q);
         }
     }
 
@@ -454,6 +504,45 @@ impl Job {
         n
     }
 
+    /// Gives plain output files (nfo, subtitles, samples of obfuscated posts) the names par2
+    /// knows them by, matched by length and the MD5 of their first 16 KiB as par2 does.
+    fn rename_plain_by_par2(&self, plan: &Plan) -> usize {
+        if plan.par2_outs.is_empty() {
+            return 0;
+        }
+        let set = self.load_par2(plan);
+        if set.files.is_empty() {
+            return 0;
+        }
+        let known: std::collections::HashSet<&str> = set.files.values().map(|f| f.name.as_str()).collect();
+        let mut n = 0;
+        for t in &plan.targets {
+            let Target::Plain { out } = *t else { continue };
+            if plan.par2_outs.contains(&out) {
+                continue;
+            }
+            let path = self.cur(&plan.paths[out]);
+            let Some(name) = path.file_name().map(|s| s.to_string_lossy().into_owned()) else { continue };
+            if known.contains(name.as_str()) {
+                continue;
+            }
+            let Ok(meta) = fs::metadata(&path) else { continue };
+            let Ok(f) = File::open(&path) else { continue };
+            let mut head = vec![0u8; (meta.len() as usize).min(16384)];
+            read_fill(&f, &mut head, 0);
+            let id = par2::md5_16k(&head);
+            let mut hits = set.files.values().filter(|d| d.len == meta.len() && d.md5_16k == id);
+            let (Some(d), None) = (hits.next(), hits.next()) else { continue };
+            let want = sanitize(&d.name);
+            let Some(dst) = path.parent().map(|p| p.join(want.file_name().unwrap_or_default())) else { continue };
+            if !dst.exists() && fs::rename(&path, &dst).is_ok() {
+                self.renamed.lock().unwrap().insert(plan.paths[out].clone(), dst);
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// The par2 set of this job (index plus any recovery volumes fetched so far).
     fn load_par2(&self, plan: &Plan) -> Par2Set {
         let mut set = Par2Set::default();
@@ -466,7 +555,7 @@ impl Job {
         set
     }
 
-    fn seg_bytes(&self, file: u32, seg: u32) -> u64 {
+    pub fn seg_bytes(&self, file: u32, seg: u32) -> u64 {
         self.files[file as usize].segs[seg as usize].bytes as u64
     }
 
@@ -475,7 +564,7 @@ impl Job {
         let mut v = vec![];
         for (i, f) in self.files.iter().enumerate() {
             if !f.skip {
-                v.push(Work { job: self.clone(), file: i as u32, seg: 0, tried: 0, bounces: 0 });
+                v.push(Work { job: self.clone(), file: i as u32, seg: 0, tried: 0, bounces: 0, stat: false, skipped: 0 });
             }
         }
         if v.is_empty() {
@@ -515,6 +604,31 @@ impl Job {
         self.drop_work(file, seg, q);
     }
 
+    /// One STAT answer: `Some(found)`, or `None` when the server could not tell (or the
+    /// item was dropped). Once the whole sample is in, a job whose projected loss is far
+    /// beyond its par2 recovery is aborted before most of it is downloaded. The sample is
+    /// spread evenly over every data file, unlike the in-order download, so a release
+    /// that only lost a few whole volumes is not mistaken for a dead one.
+    pub fn on_stat(&self, found: Option<bool>) {
+        if let Some(f) = found {
+            self.sample_known.fetch_add(1, Relaxed);
+            if !f {
+                self.sample_missing.fetch_add(1, Relaxed);
+            }
+        }
+        if self.sample_left.fetch_sub(1, Relaxed) != 1 {
+            return;
+        }
+        let (known, miss) = (self.sample_known.load(Relaxed) as u64, self.sample_missing.load(Relaxed) as u64);
+        if self.stage.load(Relaxed) != 0 || self.remaining.load(Relaxed) == 0 || miss < SAMPLE_MIN_MISSING || known * 2 < self.sample_n.load(Relaxed) as u64 {
+            return;
+        }
+        let projected = self.want_bytes.load(Relaxed) / known * miss;
+        if projected > self.recoverable.load(Relaxed).saturating_mul(2).saturating_add(1 << 20) {
+            self.aborted.store(true, Relaxed);
+        }
+    }
+
     /// Accounts for a work item without downloading it (missing or job aborted).
     pub fn drop_work(self: &Arc<Self>, file: u32, seg: u32, q: &Queues) {
         self.enc_done.fetch_add(self.seg_bytes(file, seg), Relaxed);
@@ -543,7 +657,7 @@ impl Job {
                 continue;
             }
             for s in 1..self.files[i].segs.len() {
-                rest.push(Work { job: self.clone(), file: i as u32, seg: s as u32, tried: 0, bounces: 0 });
+                rest.push(Work { job: self.clone(), file: i as u32, seg: s as u32, tried: 0, bounces: 0, stat: false, skipped: 0 });
                 remaining += 1;
             }
         }
@@ -588,7 +702,31 @@ impl Job {
                 self.apply(i as u32, &p.info, &p.data, p.crc);
             }
         }
+        // Availability sample (STAT) ahead of the download, for jobs with par2 to judge by.
+        let mut sample = vec![];
+        if !rest.is_empty() && rec > 0 {
+            let plan = self.plan.get().expect("plan");
+            let mut want = 0u64;
+            for (i, t) in plan.targets.iter().enumerate() {
+                if matches!(t, Target::Skip) || plan.par2_outs.iter().any(|o| matches!(t, Target::Plain { out } if out == o)) {
+                    continue;
+                }
+                let f = &self.files[i];
+                want += f.segs.iter().map(|s| s.bytes as u64).sum::<u64>();
+                for s in (SAMPLE_EVERY / 2..f.segs.len()).step_by(SAMPLE_EVERY) {
+                    sample.push(Work { job: self.clone(), file: i as u32, seg: s as u32, tried: 0, bounces: 0, stat: true, skipped: 0 });
+                }
+            }
+            if sample.len() >= SAMPLE_MIN {
+                self.want_bytes.store(want, Relaxed);
+                self.sample_n.store(sample.len(), Relaxed);
+                self.sample_left.store(sample.len(), Relaxed);
+            } else {
+                sample.clear();
+            }
+        }
         self.enqueue(q, rest, false);
+        self.enqueue(q, sample, true);
         self.segment_done();
     }
 
@@ -652,14 +790,25 @@ impl Job {
         let mut sevenz = vec![];
         let mut ids = vec![FileId::default(); self.files.len()];
         let job_name = self.name.clone();
-        let deobf = |name: &str| -> String {
-            if is_video(name) && is_obfuscated(name) {
-                let ext = name.rsplit('.').next().unwrap_or("mkv");
-                format!("{job_name}.{ext}")
-            } else {
-                name.to_string()
+        // `data` is the file's first article. Obfuscated video names become the job name;
+        // a video posted without an extension gets one from its header (not split pieces
+        // like `x.mkv.001`, whose first part also starts with a video header).
+        let deobf = |name: &str, data: &[u8]| -> String {
+            if is_video(name) {
+                return if is_obfuscated(name) { format!("{job_name}.{}", name.rsplit('.').next().unwrap_or("mkv")) } else { name.to_string() };
+            }
+            let ext = name.rsplit_once('.').map(|(_, e)| e);
+            if ext.is_some_and(|e| e.bytes().all(|c| c.is_ascii_digit())) {
+                return name.to_string();
+            }
+            match video_magic(data) {
+                Some(v) if is_obfuscated(name) => format!("{job_name}.{v}"),
+                Some(v) => format!("{name}.{v}"),
+                None => name.to_string(),
             }
         };
+        // Renamed outputs must not land on each other (or on a posted name).
+        let mut used: std::collections::HashSet<String> = self.files.iter().map(|f| sanitize(&f.guess).to_string_lossy().to_ascii_lowercase()).collect();
         let make = |dir: &Path, name: &str, size: u64, outs: &mut Vec<Arc<OutFile>>, paths: &mut Vec<PathBuf>| -> Target {
             let path = dir.join(sanitize(name));
             if let Some(parent) = path.parent() {
@@ -794,7 +943,15 @@ impl Job {
                 }
                 targets.push(t);
             } else {
-                let fname = deobf(&name);
+                let mut fname = deobf(&name, &p.data);
+                if fname != name {
+                    let (stem, ext) = fname.rsplit_once('.').map(|(a, b)| (a.to_string(), b.to_string())).unwrap_or_default();
+                    let mut k = 2;
+                    while !used.insert(sanitize(&fname).to_string_lossy().to_ascii_lowercase()) {
+                        fname = format!("{stem}.{k}.{ext}");
+                        k += 1;
+                    }
+                }
                 if is_video(&fname) {
                     main.push(format!("{fname} ({:.2} GB)", p.info.size as f64 / 1e9));
                 }
@@ -850,7 +1007,9 @@ impl Job {
                 }
                 continue;
             }
-            let out_name = deobf(&inner);
+            // The packed file's first bytes follow the RAR headers in the first volume.
+            let first = probes[g[0].0].as_ref().and_then(|p| p.data.get(g[0].1.data_start as usize..)).unwrap_or(&[]);
+            let out_name = deobf(&inner, first);
             let Target::Plain { out } = make(&self.work, &out_name, g[0].1.unp_size, &mut outs, &mut paths) else { continue };
             let mut off = 0;
             let mut vidx = vec![];
@@ -1534,14 +1693,18 @@ impl Job {
             let n = set.files[id].len.div_ceil(set.slice);
             for j in 0..n {
                 if !damaged_set.contains(&g) {
-                    let coefs: Vec<u16> = chosen.iter().map(|&ri| gf16::pow(bases[g], set.recv[ri].exp)).collect();
+                    let coefs: Vec<gf16::MulTable> = chosen.iter().map(|&ri| gf16::MulTable::new(gf16::pow(bases[g], set.recv[ri].exp))).collect();
                     intact.push((fk, j, coefs));
                 }
                 g += 1;
             }
         }
+        let ainv: Vec<gf16::MulTable> = ainv.iter().map(|&c| gf16::MulTable::new(c)).collect();
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
         let stripe = (s.div_ceil(threads) + 1) & !1;
+        // Each pass over the intact slices updates all k accumulators; keep them within L2
+        // (k * tile <= ~512 KiB) instead of streaming k full stripes through memory.
+        let tile = ((512 << 10) / k.max(1)).clamp(8 << 10, stripe.max(2)) & !63;
         let err = Mutex::new(None);
         std::thread::scope(|sc| {
             for t in 0..threads {
@@ -1551,26 +1714,35 @@ impl Job {
                 }
                 let (intact, chosen, ainv, err) = (&intact, &chosen, &ainv, &err);
                 sc.spawn(move || {
-                    let w = b - a;
-                    let mut acc: Vec<Vec<u8>> = chosen.iter().map(|&ri| set.recv_data(&set.recv[ri])[a..b].to_vec()).collect();
-                    let mut buf = vec![0u8; w];
-                    for (fk, j, coefs) in intact {
-                        let src = map[*fk].expect("intact slice has a source");
-                        Self::vread(plan, files, src, j * set.slice + a as u64, &mut buf);
-                        for (r, c) in coefs.iter().enumerate() {
-                            gf16::mul_add(&mut acc[r], &buf, *c);
+                    let tile = tile.max(2).min(b - a);
+                    let mut acc: Vec<Vec<u8>> = vec![vec![0u8; tile]; k];
+                    let mut buf = vec![0u8; tile];
+                    let mut x = a;
+                    while x < b {
+                        let y = (x + tile).min(b);
+                        let n = y - x;
+                        for (r, &ri) in chosen.iter().enumerate() {
+                            acc[r][..n].copy_from_slice(&set.recv_data(&set.recv[ri])[x..y]);
                         }
-                    }
-                    for (jd, d) in damaged.iter().enumerate() {
-                        buf.fill(0);
-                        for r in 0..k {
-                            gf16::mul_add(&mut buf, &acc[r], ainv[jd * k + r]);
-                        }
-                        if let Some(src) = map[d.1] {
-                            if let Err(e) = Self::vwrite(plan, files, src, d.2 * set.slice + a as u64, &buf) {
-                                *err.lock().unwrap() = Some(format!("par2 write: {e}"));
+                        for (fk, j, coefs) in intact {
+                            let src = map[*fk].expect("intact slice has a source");
+                            Self::vread(plan, files, src, j * set.slice + x as u64, &mut buf[..n]);
+                            for (r, c) in coefs.iter().enumerate() {
+                                gf16::mul_add_t(&mut acc[r][..n], &buf[..n], c);
                             }
                         }
+                        for (jd, d) in damaged.iter().enumerate() {
+                            buf[..n].fill(0);
+                            for r in 0..k {
+                                gf16::mul_add_t(&mut buf[..n], &acc[r][..n], &ainv[jd * k + r]);
+                            }
+                            if let Some(src) = map[d.1] {
+                                if let Err(e) = Self::vwrite(plan, files, src, d.2 * set.slice + x as u64, &buf[..n]) {
+                                    *err.lock().unwrap() = Some(format!("par2 write: {e}"));
+                                }
+                            }
+                        }
+                        x = y;
                     }
                 });
             }
@@ -1690,7 +1862,7 @@ impl Job {
                     r.outs.insert(i as u32, o);
                     r.paths.push(p);
                     for s in 0..self.files[i].segs.len() {
-                        work.push(Work { job: self.clone(), file: i as u32, seg: s as u32, tried: 0, bounces: 0 });
+                        work.push(Work { job: self.clone(), file: i as u32, seg: s as u32, tried: 0, bounces: 0, stat: false, skipped: 0 });
                     }
                     self.enc_total.fetch_add(self.files[i].segs.iter().map(|s| s.bytes as u64).sum(), Relaxed);
                 }
@@ -1733,11 +1905,18 @@ impl Job {
             return self.report(plan, false, vec!["cancelled".into()]);
         }
         if self.is_aborted() {
-            let msg = format!(
-                "hopeless: {:.1} MB missing (or first articles gone), only {:.1} MB of par2 recovery in NZB",
-                self.missing_bytes.load(Relaxed) as f64 / 1e6,
-                self.recoverable.load(Relaxed) as f64 / 1e6
-            );
+            let (known, miss) = (self.sample_known.load(Relaxed), self.sample_missing.load(Relaxed));
+            let (mb, rec) = (self.missing_bytes.load(Relaxed), self.recoverable.load(Relaxed));
+            let msg = if mb <= rec && miss as u64 >= SAMPLE_MIN_MISSING && known > 0 {
+                format!(
+                    "hopeless: availability sample has {miss} of {known} articles missing (~{:.0}% of {:.0} MB), only {:.1} MB of par2 recovery in NZB",
+                    miss as f64 * 100.0 / known as f64,
+                    self.want_bytes.load(Relaxed) as f64 / 1e6,
+                    rec as f64 / 1e6
+                )
+            } else {
+                format!("hopeless: {:.1} MB missing (or first articles gone), only {:.1} MB of par2 recovery in NZB", mb as f64 / 1e6, rec as f64 / 1e6)
+            };
             return self.report(plan, false, vec![msg]);
         }
         let missing = self.missing.load(Relaxed);
@@ -1818,6 +1997,10 @@ impl Job {
         }
         let ok = sets_ok && raw_ok && z_ok && write_errors == 0;
         if ok {
+            let n = self.rename_plain_by_par2(plan);
+            if n > 0 {
+                parts.push(format!("{n} files renamed from par2"));
+            }
             let _ = fs::remove_dir_all(self.work.join(".aux"));
             if let Some(done) = &self.done_dir {
                 if let Some(parent) = done.parent() {

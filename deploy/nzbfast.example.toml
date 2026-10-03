@@ -25,6 +25,7 @@ active_jobs = 256        # jobs downloading at once (small jobs need many to fil
 depth = 8                # pipelined BODY requests per connection
 nic = "eth0"             # interface shown as "NIC" in the UI
 io_threads = 8
+write_buffer_mb = 0      # MiB of finished chunks waiting for disk; 0 = 1/16 of RAM (256..4096)
 mover_jobs = 2           # jobs copied to complete_dir at once
 mover_threads = 4        # parallel range copies per file
 history_keep = 20000

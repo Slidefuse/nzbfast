@@ -29,6 +29,10 @@ pub struct SvcCfg {
     pub depth: usize,
     pub nic: String,
     pub io_threads: usize,
+    /// RAM for complete output chunks waiting for disk, and for reusable buffers (MiB).
+    /// Writers block when it is used up, so a slow disk throttles downloading instead of
+    /// growing RAM. 0 = auto: 1/16 of physical RAM, between 256 MiB and 4 GiB.
+    pub write_buffer_mb: usize,
     /// Jobs moved to `complete_dir` concurrently, and copy threads per file.
     pub mover_jobs: usize,
     pub mover_threads: usize,
@@ -59,6 +63,7 @@ impl Default for SvcCfg {
             depth: 8,
             nic: "eth0".into(),
             io_threads: 8,
+            write_buffer_mb: 0,
             mover_jobs: 2,
             mover_threads: 4,
             history_keep: 20000,

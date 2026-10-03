@@ -137,6 +137,7 @@ impl Hub {
         let mut free = (0, 0);
         let mut move_rate = 0.0f64;
         let mut job_rate: HashMap<usize, (u64, f64)> = HashMap::new();
+        let mut move_rate_j: HashMap<String, VecDeque<(Instant, u64)>> = HashMap::new();
         let mut win = Window { ticks: VecDeque::with_capacity(50) };
         let mut cache = JobCache::default();
         loop {
@@ -168,7 +169,7 @@ impl Hub {
             prev_nic = nb;
             win.push(dt, total * dt, nic_b, srv_b);
             let (r1, nic1, srv1) = win.rates(10);
-            let (r5, _, _) = win.rates(50);
+            let (r5, nic5, _) = win.rates(50);
             eng.rate5.store(r5 as u64, Relaxed);
             {
                 let mut ring = self.ring.lock().unwrap();
@@ -191,7 +192,7 @@ impl Hub {
             if self.clients.load(Relaxed) == 0 {
                 continue;
             }
-            let snap = self.build(&eng, tick, total, nic, (r1, nic1, r5), &srv, &srv1, cpu_pct, rss, free, move_rate, &mut job_rate, &mut cache, dt);
+            let snap = self.build(&eng, tick, total, nic, (r1, nic1, r5, nic5), &srv, &srv1, cpu_pct, rss, free, move_rate, &mut job_rate, &mut move_rate_j, &mut cache, dt);
             let mut s = self.snap.lock().unwrap();
             *s = (tick, Arc::from(snap.as_str()));
             drop(s);
@@ -206,7 +207,7 @@ impl Hub {
         tick: u64,
         rx: f64,
         nic: f64,
-        (r1, nic1, r5): (f64, f64, f64),
+        (r1, nic1, r5, nic5): (f64, f64, f64, f64),
         srv: &[f64],
         srv1: &[f64],
         cpu: f64,
@@ -214,6 +215,7 @@ impl Hub {
         free: (u64, u64),
         move_rate: f64,
         job_rate: &mut HashMap<usize, (u64, f64)>,
+        move_rate_j: &mut HashMap<String, VecDeque<(Instant, u64)>>,
         cache: &mut JobCache,
         dt: f64,
     ) -> String {
@@ -271,6 +273,8 @@ impl Hub {
                         r.job.missing.load(Relaxed),
                         e.m.prio,
                         r.started.elapsed().as_secs(),
+                        // Per server: [items in flight, recent miss share %].
+                        (0..eng.servers.len()).map(|i| json!([r.job.route.inflight(i), (r.job.route.miss_share(i) * 100.0).round()])).collect::<Vec<_>>(),
                     ]));
                 }
             }
@@ -280,6 +284,26 @@ impl Hub {
         }
         let (nq, nact, left, npaused) = cache.q;
         let jobs = &cache.jobs;
+        // Moves in progress: [nzo, name, cat, done, total, rate over the last 2 s, elapsed s].
+        let moves: Vec<Value> = {
+            let mv = eng.moves.lock().unwrap();
+            move_rate_j.retain(|k, _| mv.iter().any(|p| &p.nzo == k));
+            let now = Instant::now();
+            mv.iter()
+                .map(|p| {
+                    let d = p.done.load(Relaxed);
+                    let w = move_rate_j.entry(p.nzo.clone()).or_default();
+                    w.push_back((now, d));
+                    while w.len() > 2 && now.duration_since(w[1].0) >= Duration::from_secs(2) {
+                        w.pop_front();
+                    }
+                    let (t0, d0) = w[0];
+                    let span = now.duration_since(t0).as_secs_f64();
+                    let rate = if span > 0.05 { (d - d0) as f64 / span } else { 0.0 };
+                    json!([p.nzo, p.name, p.cat, d, p.total.max(d), rate.round(), p.t0.elapsed().as_secs()])
+                })
+                .collect()
+        };
         let eta = if r5 > 1.0 { (left as f64 / r5) as u64 } else { 0 };
         let snap = json!({
             "t": now_ms(),
@@ -287,12 +311,14 @@ impl Hub {
             "rx": rx.round(),
             "nic": nic.round(),
             "nic1": nic1.round(),
+            "nic5": nic5.round(),
             "r1": r1.round(),
             "r5": r5.round(),
             "srv": servers,
             "q": [nq, nact, left, eta, npaused, eng.q.len()],
             "st": [eng.reserved.load(Relaxed), (eng.cfg.staging_limit_gb * 1e9) as u64, free.0, free.1],
             "mv": [eng.moving.load(Relaxed), move_rate.round(), eng.move_backlog.load(Relaxed)],
+            "mvj": moves,
             "s": [eng.stats.iter().map(|s| s.bytes.load(Relaxed)).sum::<u64>(), eng.jobs_ok.load(Relaxed), eng.jobs_failed.load(Relaxed), eng.started.elapsed().as_secs()],
             "sys": [(cpu * 10.0).round() / 10.0, rss, outfile::CHUNKS_LIVE.load(Relaxed) as u64 * outfile::CHUNK, std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)],
             "p": eng.paused.load(Relaxed) as u8,

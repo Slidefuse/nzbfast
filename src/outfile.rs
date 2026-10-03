@@ -40,6 +40,27 @@ fn layout() -> Layout {
 
 static POOL: Mutex<Vec<ABuf>> = Mutex::new(Vec::new());
 pub static CHUNKS_LIVE: AtomicUsize = AtomicUsize::new(0);
+/// Write-buffer budget in chunks (128 = 1 GiB): bounds complete chunks queued for disk
+/// (the I/O channels block when full, which throttles downloading on a slow disk) and the
+/// free buffers kept for reuse. Partial chunks are not counted: there is roughly one per
+/// article in flight, and they only complete as more articles arrive.
+static BUDGET: AtomicUsize = AtomicUsize::new(128);
+
+/// Sets the write-buffer budget in MiB (0 = 1/16 of RAM, 256 MiB..4 GiB; minimum 2
+/// chunks). Call before `start_io`. Returns the budget in MiB.
+pub fn set_budget_mb(mb: usize) -> usize {
+    let mb = if mb > 0 { mb } else { (total_ram_mb() / 16).clamp(256, 4096) };
+    BUDGET.store((mb << 20).div_ceil(CHUNK as usize).max(2), Relaxed);
+    mb
+}
+
+fn total_ram_mb() -> usize {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|m| m.lines().find(|l| l.starts_with("MemTotal:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|k| k.parse::<usize>().ok()))
+        .map(|kb| kb / 1024)
+        .unwrap_or(8192)
+}
 
 fn get_buf() -> ABuf {
     CHUNKS_LIVE.fetch_add(1, Relaxed);
@@ -54,7 +75,7 @@ fn get_buf() -> ABuf {
 fn put_buf(b: ABuf) {
     CHUNKS_LIVE.fetch_sub(1, Relaxed);
     let mut p = POOL.lock().unwrap();
-    if p.len() < 1024 {
+    if p.len() < BUDGET.load(Relaxed) {
         p.push(b);
     } else {
         unsafe { dealloc(b.0, layout()) };
@@ -98,8 +119,9 @@ static IO: OnceLock<IoPool> = OnceLock::new();
 
 pub fn start_io(threads: usize) {
     let mut txs = vec![];
+    let depth = (BUDGET.load(Relaxed) / threads.max(1)).max(2);
     for _ in 0..threads {
-        let (tx, rx) = sync_channel::<IoReq>(64);
+        let (tx, rx) = sync_channel::<IoReq>(depth);
         txs.push(tx);
         std::thread::spawn(move || io_thread(rx));
     }

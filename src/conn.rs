@@ -289,7 +289,8 @@ fn pop_live(ctx: &ConnCtx, wait: Option<Duration>) -> Option<Work> {
     loop {
         let w = ctx.q.pop(ctx.idx, wait)?;
         if w.job.is_aborted() {
-            w.job.drop_work(w.file, w.seg, &ctx.q);
+            w.job.route.settle(ctx.idx);
+            w.dropped(&ctx.q);
             continue;
         }
         return Some(w);
@@ -334,6 +335,7 @@ pub fn run(ctx: ConnCtx) {
             }
             match probe(&ctx) {
                 Ok(()) => {
+                    ctx.q.login_ok(ctx.idx);
                     eprintln!("[{}] reachable again", ctx.cfg.name);
                     ctx.st.consec_fail.store(0, Relaxed);
                     ctx.q.set_down(ctx.idx, false);
@@ -343,21 +345,23 @@ pub fn run(ctx: ConnCtx) {
             }
             continue;
         }
-        // Only connect when there is work.
-        let Some(first) = pop_live(&ctx, Some(Duration::from_secs(5))) else {
+        // Only connect when there is work, but take it only once logged in: a server that
+        // stalls the login (some answer 502 only after ~20 s) must not sit on articles
+        // that healthy servers could fetch meanwhile.
+        if !ctx.q.wait_work(ctx.idx, Duration::from_secs(5)) {
             if ctx.q.is_closed() {
                 return;
             }
             continue;
-        };
+        }
         let mut inflight: VecDeque<Work> = VecDeque::new();
-        inflight.push_back(first);
         match session(&ctx, &mut inflight) {
             Ok(()) => backoff = 1,
             Err(e) => {
                 note_error(&ctx, &e);
+                ctx.q.login_failed(ctx.idx, ctx.st.live.load(Relaxed));
                 for w in ctx.q.give_back(ctx.idx, inflight.drain(..).collect()) {
-                    w.job.on_missing(w.file, w.seg, &ctx.q);
+                    w.missing(&ctx.q);
                 }
                 let fails = ctx.st.consec_fail.fetch_add(1, Relaxed) + 1;
                 if fails >= DOWN_AFTER && ctx.st.live.load(Relaxed) == 0 && !ctx.q.is_down(ctx.idx) {
@@ -372,9 +376,11 @@ pub fn run(ctx: ConnCtx) {
 }
 
 fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>) -> io::Result<()> {
+    ctx.q.connecting(ctx.idx);
     let s = connect(&ctx.cfg, &ctx.tls)?;
     let mut rd = Rd { s, buf: vec![0; 8 << 20], start: 0, end: 0, rx: Some(ctx.st.clone()) };
     login(&mut rd, &ctx.cfg)?;
+    ctx.q.login_ok(ctx.idx);
     ctx.st.consec_fail.store(0, Relaxed);
     ctx.st.live.fetch_add(1, Relaxed);
     struct Live<'a>(&'a AtomicU64);
@@ -409,7 +415,7 @@ fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>) -> io::Result<()> {
         if sent < inflight.len() {
             req.clear();
             for w in inflight.iter().skip(sent) {
-                req.push_str("BODY ");
+                req.push_str(if w.stat { "STAT " } else { "BODY " });
                 req.push_str(w.job.msgid(w.file, w.seg));
                 req.push_str("\r\n");
             }
@@ -427,6 +433,7 @@ fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>) -> io::Result<()> {
                 sent -= 1;
                 LIMIT.consume((e - s) as u64);
                 ctx.q.record(ctx.idx, true, w.tried != 0);
+                w.job.route.record(ctx.idx, true);
                 match yenc::decode(&rd.buf[s..e], &mut out) {
                     Ok((info, crc)) => {
                         ctx.st.ok.fetch_add(1, Relaxed);
@@ -437,22 +444,37 @@ fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>) -> io::Result<()> {
                             eprintln!("[{}] decode error {:?} for {}", ctx.cfg.name, e, w.job.msgid(w.file, w.seg));
                         }
                         if let Some(w) = ctx.q.retry_elsewhere(ctx.idx, w) {
-                            w.job.on_missing(w.file, w.seg, &ctx.q);
+                            w.missing(&ctx.q);
                         }
                     }
                 }
             }
+            "223" => {
+                // STAT: the article exists.
+                let w = inflight.pop_front().unwrap();
+                sent -= 1;
+                ctx.q.record(ctx.idx, true, w.tried != 0);
+                w.job.route.record(ctx.idx, true);
+                w.job.on_stat(Some(true));
+            }
             c if article_unavailable(c) => {
                 let w = inflight.pop_front().unwrap();
                 sent -= 1;
+                if w.stat && !matches!(c, "430" | "423") {
+                    // A server that does not do STAT says nothing about availability.
+                    w.job.route.settle(ctx.idx);
+                    w.job.on_stat(None);
+                    continue;
+                }
                 if !matches!(c, "430" | "423" | "451") && ctx.st.odd_replies.fetch_add(1, Relaxed) < 5 {
                     eprintln!("[{}] {} for {} (treated as missing)", ctx.cfg.name, &status[..status.len().min(60)], w.job.msgid(w.file, w.seg));
                 }
                 ctx.st.missing.fetch_add(1, Relaxed);
                 ctx.q.record(ctx.idx, false, w.tried != 0);
+                w.job.route.record(ctx.idx, false);
                 ctx.q.record_miss_time(ctx.idx, since.as_micros() as u64);
                 if let Some(w) = ctx.q.retry_elsewhere(ctx.idx, w) {
-                    w.job.on_missing(w.file, w.seg, &ctx.q);
+                    w.missing(&ctx.q);
                 }
             }
             _ => return Err(err(format!("unexpected: {}", &status[..status.len().min(80)]))),

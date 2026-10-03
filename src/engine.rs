@@ -134,6 +134,16 @@ struct Done {
     downloaded: u64,
 }
 
+/// Progress of one job being moved to its category folder.
+pub struct MoveProg {
+    pub nzo: String,
+    pub name: String,
+    pub cat: String,
+    pub total: u64,
+    pub done: AtomicU64,
+    pub t0: Instant,
+}
+
 struct MoveTask {
     nzo: String,
     src: PathBuf,
@@ -185,6 +195,8 @@ pub struct Engine {
     pub reserved: AtomicU64,
     pub moved: AtomicU64,
     pub moving: AtomicUsize,
+    /// Moves in progress (touched only when a move starts or ends, and by the sampler).
+    pub moves: Mutex<Vec<Arc<MoveProg>>>,
     pub move_backlog: AtomicU64,
     pub jobs_ok: AtomicU64,
     pub jobs_failed: AtomicU64,
@@ -307,8 +319,11 @@ impl Engine {
             libc::signal(libc::SIGINT, on_term as *const () as libc::sighandler_t);
         }
 
+        let wb = outfile::set_budget_mb(cfg.write_buffer_mb);
+        eprintln!("write buffer {wb} MiB");
         outfile::start_io(cfg.io_threads.max(1));
-        let q = Arc::new(Queues::new(servers.iter().map(|s| s.priority).collect()));
+        let slots = servers.iter().map(|s| (s.conns * if s.depth > 0 { s.depth } else { cfg.depth }) as u32).collect();
+        let q = Arc::new(Queues::new(servers.iter().map(|s| s.priority).collect(), slots));
         let _ = job::QUEUE.set(q.clone());
         let stats: Vec<Arc<SStats>> = servers.iter().map(|_| Arc::new(SStats::default())).collect();
         let mut total = 0;
@@ -398,6 +413,7 @@ impl Engine {
             reserved: AtomicU64::new(0),
             moved: AtomicU64::new(0),
             moving: AtomicUsize::new(0),
+            moves: Mutex::new(Vec::new()),
             move_backlog: AtomicU64::new(0),
             jobs_ok: AtomicU64::new(0),
             jobs_failed: AtomicU64::new(0),
@@ -503,6 +519,16 @@ impl Engine {
         if let (Some(a), true) = (name.find("{{"), name.ends_with("}}")) {
             password = Some(name[a + 2..name.len() - 2].to_string()).filter(|p| !p.is_empty());
             name.truncate(a);
+        }
+        // Some indexer feeds escape more than once, so titles arrive as
+        // "Minions.&amp;.Monsters" or even "Asterix.&amp;amp;.Obelix".
+        let mut name = name;
+        for _ in 0..3 {
+            let u = nzb::xml_unescape(&name);
+            if u == name {
+                break;
+            }
+            name = u;
         }
         let name = clean_name(&name);
         let parsed = nzb::parse(&String::from_utf8_lossy(&data), name.clone())?;
@@ -771,11 +797,12 @@ impl Engine {
         let mut prev: Vec<u64> = vec![0; self.stats.len()];
         loop {
             self.handle_done();
+            self.grow_grants();
             self.activate();
             if last_sec.elapsed() >= Duration::from_secs(1) {
                 last_sec = Instant::now();
                 for w in self.q.sweep() {
-                    w.job.on_missing(w.file, w.seg, &self.q);
+                    w.missing(&self.q);
                 }
                 let day = day_string(unix_now());
                 let mut d = self.daily.lock().unwrap();
@@ -801,10 +828,40 @@ impl Engine {
         }
     }
 
+    /// Hands staging space freed by the movers to jobs started with only part of
+    /// theirs, before any new job may take it.
+    fn grow_grants(&self) {
+        let limit = (self.cfg.staging_limit_gb * 1e9) as u64;
+        let mut st = self.store.lock().unwrap();
+        for e in st.queue.iter_mut() {
+            let Some(run) = e.run.as_mut() else { continue };
+            if run.job.grant.load(Relaxed) == u64::MAX {
+                continue;
+            }
+            let reserved = self.reserved.load(Relaxed);
+            let want = e.m.bytes.saturating_sub(run.reserved);
+            // Alone in staging, a job may exceed the budget (as one job always may).
+            let alone = reserved == run.reserved && self.moving.load(Relaxed) == 0;
+            let g = if alone { want } else { want.min(limit.saturating_sub(reserved)) };
+            if g == 0 {
+                continue;
+            }
+            self.reserved.fetch_add(g, Relaxed);
+            run.reserved += g;
+            if g == want {
+                run.job.grant.store(u64::MAX, Relaxed);
+            } else {
+                run.job.grant.fetch_add(g, Relaxed);
+            }
+        }
+    }
+
     fn activate(&self) {
         let limit = (self.cfg.staging_limit_gb * 1e9) as u64;
         loop {
-            if self.paused.load(Relaxed) || self.q.len() >= self.low_water {
+            // Retry backlogs do not count: articles waiting for one particular server must
+            // not starve the others of first attempts.
+            if self.paused.load(Relaxed) || self.q.main_len() >= self.low_water {
                 return;
             }
             let (nzo, need) = {
@@ -813,34 +870,44 @@ impl Engine {
                 if active >= self.cfg.active_jobs {
                     return;
                 }
+                // Freed space goes to a job still short of its staging first.
+                if st.queue.iter().any(|e| e.run.as_ref().is_some_and(|r| r.job.grant.load(Relaxed) != u64::MAX)) {
+                    return;
+                }
                 let eligible = |e: &Entry| e.run.is_none() && !e.loading && !e.m.paused;
                 let Some(head) = st.queue.iter().position(eligible) else { return };
                 // Always allow one job, even if it alone exceeds the budget.
                 let busy = active > 0 || self.moving.load(Relaxed) > 0;
                 let reserved = self.reserved.load(Relaxed);
                 let fits = |e: &Entry| !busy || reserved + e.m.bytes <= limit;
+                // Staging granted up front; `None` = all of it.
+                let mut part = None;
                 let i = if fits(&st.queue[head]) {
                     *self.head_wait.lock().unwrap() = None;
                     head
                 } else {
                     // A big job waiting for staging space should not idle the network:
-                    // start smaller ones behind it, unless it has waited long enough
-                    // that space must be left to free up for it.
+                    // start smaller ones behind it, unless it has waited long enough.
+                    // Then it starts in the space there is and grows as the movers free
+                    // more, instead of the network idling until all of it is free.
                     let mut hw = self.head_wait.lock().unwrap();
                     let nzo = &st.queue[head].m.nzo;
                     if hw.as_ref().is_none_or(|(n, _)| n != nzo) {
                         *hw = Some((nzo.clone(), Instant::now()));
                     }
                     if hw.as_ref().is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(300)) {
-                        return;
-                    }
-                    drop(hw);
-                    match st.queue.iter().enumerate().skip(head + 1).filter(|(_, e)| eligible(e)).take(64).find(|(_, e)| fits(e)) {
-                        Some((j, _)) => j,
-                        None => return,
+                        *hw = None;
+                        part = Some(limit.saturating_sub(reserved));
+                        head
+                    } else {
+                        drop(hw);
+                        match st.queue.iter().enumerate().skip(head + 1).filter(|(_, e)| eligible(e)).take(64).find(|(_, e)| fits(e)) {
+                            Some((j, _)) => j,
+                            None => return,
+                        }
                     }
                 };
-                let need = st.queue[i].m.bytes;
+                let need = part.unwrap_or(st.queue[i].m.bytes);
                 st.queue[i].loading = true;
                 (st.queue[i].m.nzo.clone(), need)
             };
@@ -859,6 +926,9 @@ impl Engine {
                     let job = Job::new(id, n, self.cfg.staging_dir.join(&nzo), None, self.finished.clone());
                     if st.queue[i].m.paused {
                         job.pause(&self.q);
+                    }
+                    if need < st.queue[i].m.bytes {
+                        job.grant.store(need, Relaxed);
                     }
                     self.reserved.fetch_add(need, Relaxed);
                     st.queue[i].run = Some(Run { job: job.clone(), started: Instant::now(), reserved: need });
@@ -973,6 +1043,17 @@ impl Engine {
             // The partial copy has a fixed name, so a move interrupted by a restart
             // picks up where it was; the final name is chosen when it is complete.
             let tmp = self.cat_dir(&t.meta.cat).join(format!("_FAST_{}", t.nzo));
+            // Files a resumed move already put in place count as done.
+            let already = tree_size(&tmp);
+            let prog = Arc::new(MoveProg {
+                nzo: t.nzo.clone(),
+                name: t.meta.name.clone(),
+                cat: t.meta.cat.clone(),
+                total: already + tree_size(&t.src),
+                done: AtomicU64::new(already),
+                t0,
+            });
+            self.moves.lock().unwrap().push(prog.clone());
             // Staging space is handed back file by file, so new jobs can start while
             // a large job is still being copied.
             let mut left = t.reserved;
@@ -984,7 +1065,7 @@ impl Engine {
                 self.kick.notify();
             };
             let res = fs::create_dir_all(&tmp)
-                .and_then(|_| move_tree(&t.src, &tmp, &self.moved, self.cfg.mover_threads.max(1), &mut release))
+                .and_then(|_| move_tree(&t.src, &tmp, &[&self.moved, &prog.done], self.cfg.mover_threads.max(1), &mut release))
                 // After a restart some files may already be in place: count what is there.
                 .and_then(|_| if count_files(&tmp) == 0 { Err(io::Error::other("no files were produced")) } else { Ok(()) })
                 .and_then(|_| {
@@ -1004,6 +1085,7 @@ impl Engine {
             }
             let _ = fs::remove_dir_all(&t.src);
             release(u64::MAX);
+            self.moves.lock().unwrap().retain(|p| !Arc::ptr_eq(p, &prog));
             self.moving.fetch_sub(1, Relaxed);
             let mut done_nzb = None;
             let mut st = self.store.lock().unwrap();
@@ -1092,7 +1174,7 @@ impl Engine {
 
 /// Moves a directory tree; files that cannot be renamed (other filesystem) are copied
 /// in parallel ranges. `done` is called with each file's size. Returns the number of files.
-fn move_tree(src: &Path, dst: &Path, ctr: &AtomicU64, threads: usize, done: &mut dyn FnMut(u64)) -> io::Result<usize> {
+fn move_tree(src: &Path, dst: &Path, ctr: &[&AtomicU64], threads: usize, done: &mut dyn FnMut(u64)) -> io::Result<usize> {
     fs::create_dir_all(dst)?;
     let mut n = 0;
     for e in fs::read_dir(src)? {
@@ -1108,7 +1190,7 @@ fn move_tree(src: &Path, dst: &Path, ctr: &AtomicU64, threads: usize, done: &mut
         } else if ft.is_file() {
             let len = e.metadata().map(|m| m.len()).unwrap_or(0);
             if fs::rename(&p, &d).is_ok() {
-                ctr.fetch_add(len, Relaxed);
+                ctr.iter().for_each(|c| _ = c.fetch_add(len, Relaxed));
             } else {
                 copy_file(&p, &d, ctr, threads)?;
                 // Free the staging copy right away.
@@ -1125,7 +1207,7 @@ fn move_tree(src: &Path, dst: &Path, ctr: &AtomicU64, threads: usize, done: &mut
 /// the NFS client then streams large asynchronous WRITEs and commits once per file,
 /// which the NAS absorbs far faster than per-write commits (O_DIRECT) or several
 /// writers contending for the same inode.
-fn copy_file(src: &Path, dst: &Path, ctr: &AtomicU64, _threads: usize) -> io::Result<()> {
+fn copy_file(src: &Path, dst: &Path, ctr: &[&AtomicU64], _threads: usize) -> io::Result<()> {
     let s = File::open(src)?;
     let len = s.metadata()?.len();
     let d = OpenOptions::new().write(true).create(true).truncate(true).open(dst)?;
@@ -1135,10 +1217,26 @@ fn copy_file(src: &Path, dst: &Path, ctr: &AtomicU64, _threads: usize) -> io::Re
         let k = ((len - pos) as usize).min(buf.len());
         s.read_exact_at(&mut buf[..k], pos)?;
         d.write_all_at(&buf[..k], pos)?;
-        ctr.fetch_add(k as u64, Relaxed);
+        ctr.iter().for_each(|c| _ = c.fetch_add(k as u64, Relaxed));
         pos += k as u64;
     }
     d.sync_all()
+}
+
+/// Bytes in the regular files under `dir` (0 if it does not exist).
+fn tree_size(dir: &Path) -> u64 {
+    fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_name() != ".aux")
+                .map(|e| match e.file_type() {
+                    Ok(t) if t.is_dir() => tree_size(&e.path()),
+                    Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
+                    _ => 0,
+                })
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 fn count_files(dir: &Path) -> usize {

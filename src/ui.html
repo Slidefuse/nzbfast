@@ -121,8 +121,8 @@ td.act button{margin-left:4px}
 <div class="hero">
   <div class="panel speed">
     <div><span class="big" id="spd">0.00</span><span class="unit" id="spdu">Gbit/s</span></div>
-    <div class="sub"><span id="spdB">0 MB/s</span> payload · NIC <span id="nic">0</span></div>
-    <div class="sub">5 s <span id="r5">0</span> · peak <span id="peak">0</span> <span style="color:var(--faint)">(1 s average)</span></div>
+    <div class="sub"><span id="spdB">0 MB/s</span> on the wire · payload <span id="pay">0</span></div>
+    <div class="sub">5 s <span id="r5">0</span> · peak <span id="peak">0</span> <span style="color:var(--faint)">(NIC, 1 s average)</span></div>
   </div>
   <div class="panel graphwrap">
     <div class="graphhead">
@@ -220,6 +220,10 @@ const N = 3000;                       // samples kept (5 min at 10 Hz)
 let INIT = null, S = null, dirty = false, win = 1200;
 const ring = {rx: new Float32Array(N), nic: new Float32Array(N), srv: [], len: 0, head: 0};
 let lastK = -1, peak = 0, ringK = -1;
+// Graph clock in (fractional) ticks: advances with wall time and trails the newest
+// sample by LAG ticks so uneven SSE delivery never shows as a stutter.
+let Kd = -1, msgT = 0, lastFrame = 0;
+const LAG = 1.5;
 
 // ---------- formatting ----------
 function bits(Bps) { // bytes/s -> [value, unit]
@@ -310,14 +314,15 @@ function connect() {
   es.onmessage = e => {
     S = JSON.parse(e.data);
     let steps = lastK < 0 ? 1 : Math.min(50, Math.max(1, S.k - lastK));
-    lastK = S.k; ringK = S.k;
-    if (S.r1 > peak) peak = S.r1;
+    lastK = S.k; ringK = S.k; msgT = performance.now();
+    if (nicRate(S) > peak) peak = nicRate(S);
     while (steps--) push(S.rx, S.nic, S.srv.map(s => s[12] !== undefined ? s[12] : s[0]));
     dirty = true;
   };
   es.onopen = () => cls($("#conn"), "on");
   es.onerror = () => { cls($("#conn"), ""); fetch("/ui/session").then(r => r.json()).then(j => { if (!j.auth) { es.close(); showLogin(); } }).catch(() => {}); };
 }
+const nicRate = S => S.nic1 !== undefined ? S.nic1 : S.r1;
 function push(rx, nic, srv) {
   const h = ring.head;
   ring.rx[h] = rx; ring.nic[h] = nic;
@@ -325,7 +330,7 @@ function push(rx, nic, srv) {
   ring.head = (h + 1) % N; ring.len = Math.min(N, ring.len + 1);
 }
 function loadRing(r) {
-  ring.len = 0; ring.head = 0; peak = 0; lastK = -1;
+  ring.len = 0; ring.head = 0; peak = 0; lastK = -1; Kd = -1;
   ring.srv = INIT.servers.map(() => new Float32Array(N));
   for (let i = 0; i < r.rx.length; i++) push(r.rx[i], r.nic[i], r.srv.map(a => a[i]));
   // The ring ends at the newest tick; the first live snapshot re-anchors lastK.
@@ -357,48 +362,71 @@ function niceStep(maxBits) {
 let theme = null;
 matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => { theme = null; dirty = true; });
 // Samples are averaged into bins anchored to absolute tick numbers, so a sample
-// never changes bin as the graph scrolls (no shimmer), and the x position of each
-// bin moves smoothly with time.
+// never changes bin as the graph scrolls (no shimmer). Only complete bins are drawn
+// (a half-filled newest bin would wobble as it fills), each placed at its end tick
+// relative to the smooth clock Kd, so new points slide in from the right edge.
+// Per-server byte counts arrive in bursts (readers drain socket buffers after a
+// stall), so the stack's height is the wire rate (NIC, capped by the payload
+// averaged over SHARE ticks) and that is split by each server's share of bytes
+// over the same SHARE ticks.
+const SHARE = 20;
 const BIN = {300: 2, 1200: 5, 3000: 10};
 const bins = {n: 0, x: null, nic: null, stack: [], ok: null};
-function drawGraph() {
+function tickClock(now) {
+  const dt = lastFrame ? Math.min(0.25, (now - lastFrame) / 1000) : 0; lastFrame = now;
+  if (lastK < 0) return dt;
+  const target = lastK + Math.min(1, (now - msgT) / 100) - LAG;
+  if (Kd < 0 || Math.abs(target - Kd) > 10) Kd = target;
+  else Kd += Math.max(0, dt * 10 + (target - Kd) * Math.min(1, dt * 2));
+  if (Kd > lastK) Kd = lastK;
+  return dt;
+}
+function drawGraph(dt) {
   if (!gw) return;
   if (!theme) { const css = getComputedStyle(document.documentElement); theme = {line: css.getPropertyValue("--line").trim(), dim: css.getPropertyValue("--dim").trim(), text: css.getPropertyValue("--text").trim(), mono: css.getPropertyValue("--mono")}; }
   const cLine = theme.line, cDim = theme.dim, cText = theme.text;
   cx.setTransform(dpr, 0, 0, dpr, 0, 0);
   cx.clearRect(0, 0, gw, gh);
   const L = 44, R = 6, T = 6, B = 16, pw = gw - L - R, ph = gh - T - B;
-  const ns = ring.srv.length, b = BIN[win] || 5, nb = Math.ceil(win / b) + 1;
+  const ns = ring.srv.length, b = BIN[win] || 5, nb = Math.ceil(win / b) + 2;
   if (bins.n !== nb || bins.stack.length !== ns) {
     bins.n = nb; bins.x = new Float32Array(nb); bins.nic = new Float32Array(nb); bins.ok = new Uint8Array(nb);
     bins.stack = Array.from({length: ns}, () => new Float32Array(nb));
   }
-  const K = ringK, B0 = Math.floor(K / b);
+  const K = ringK, Bc = Math.floor((K + 1) / b) - 1, kd = Kd < 0 ? K : Kd;
   let target = 0;
   for (let j = 0; j < nb; j++) {
-    const t0 = (B0 - j) * b;
+    const t0 = (Bc - j) * b;
     let cnt = 0, nic = 0;
-    for (let s = 0; s < ns; s++) bins.stack[s][j] = 0;
     for (let t = t0; t < t0 + b; t++) {
       const age = K - t;
-      if (age < 0 || age >= ring.len || age >= win) continue;
-      const idx = (ring.head - 1 - age + 2 * N) % N;
-      for (let s = 0; s < ns; s++) bins.stack[s][j] += ring.srv[s][idx];
-      nic += ring.nic[idx]; cnt++;
+      if (age < 0 || age >= ring.len) continue;
+      nic += ring.nic[(ring.head - 1 - age + 2 * N) % N]; cnt++;
     }
-    bins.ok[j] = cnt > 0 ? 1 : 0;
-    bins.x[j] = L + pw - ((K - (t0 + (b - 1) / 2)) / win) * pw;
-    if (!cnt) continue;
-    let acc = 0;
-    for (let s = 0; s < ns; s++) { acc += bins.stack[s][j] / cnt; bins.stack[s][j] = acc; }
+    bins.ok[j] = cnt === b ? 1 : 0;
+    bins.x[j] = L + pw - ((kd - (t0 + b - 1)) / win) * pw;
+    if (!bins.ok[j]) continue;
+    const te = t0 + b - 1, sw = Math.max(SHARE, b);
+    let pay = 0, pc = 0;
+    for (let s = 0; s < ns; s++) bins.stack[s][j] = 0;
+    for (let t = te - sw + 1; t <= te; t++) {
+      const age = K - t;
+      if (age >= ring.len) continue;
+      const idx = (ring.head - 1 - age + 2 * N) % N;
+      for (let s = 0; s < ns; s++) { bins.stack[s][j] += ring.srv[s][idx]; pay += ring.srv[s][idx]; }
+      pc++;
+    }
     bins.nic[j] = nic / cnt;
+    const k = pay > 0 ? Math.min(bins.nic[j], pay / pc) / pay : 0;
+    let acc = 0;
+    for (let s = 0; s < ns; s++) { acc += bins.stack[s][j] * k; bins.stack[s][j] = acc; }
     target = Math.max(target, acc, bins.nic[j]);
   }
   // Stable axis: pinned just above the line rate once traffic is in that range;
   // grows at once, shrinks slowly.
   let top = Math.max(target * 1.1, 1.25e6);
   if (INIT && INIT.line && target > INIT.line * 0.3) top = Math.max(top, INIT.line * 1.1);
-  yMax = top > yMax ? top : yMax + (top - yMax) * 0.03;
+  yMax = top > yMax ? top : yMax + (top - yMax) * (1 - Math.exp(-dt * 0.3));
   const y = v => T + ph - Math.min(v / yMax, 1.02) * ph;
   const step = niceStep(yMax * 8) / 8;
   cx.font = "11px " + theme.mono; cx.textAlign = "right"; cx.textBaseline = "middle";
@@ -460,10 +488,10 @@ $("#win").addEventListener("click", e => {
 // ---------- live panels ----------
 function render() {
   if (!S) return;
-  const [v, u] = bits(S.r1);
+  const [v, u] = bits(nicRate(S));
   txt($("#spd"), v); txt($("#spdu"), u);
-  txt($("#spdB"), frate(S.r1)); txt($("#nic"), fbits(S.nic1 !== undefined ? S.nic1 : S.nic));
-  txt($("#r5"), fbits(S.r5)); txt($("#peak"), fbits(peak));
+  txt($("#spdB"), frate(nicRate(S))); txt($("#pay"), fbits(S.r1));
+  txt($("#r5"), fbits(S.nic5 !== undefined ? S.nic5 : S.r5)); txt($("#peak"), fbits(peak));
   const nq = S.q[0], nact = S.q[1];
   const state = S.p ? ["paused", "pill warn"] : nact ? ["downloading", "pill ok"] : nq ? ["waiting", "pill acc"] : ["idle", "pill"];
   txt($("#state"), state[0]); cls($("#state"), state[1]);
@@ -517,10 +545,13 @@ function renderServers() {
   txt($("#srvc"), up + " of " + S.srv.length + " up · " + S.srv.reduce((a, s) => a + s[1], 0) + " connections");
 }
 
-const PHASE = {probing: "acc", downloading: "ok", verifying: "vio", repairing: "warn", "fetching par2": "warn", extracting: "vio", finishing: "vio", paused: ""};
+const PHASE = {probing: "acc", downloading: "ok", verifying: "vio", repairing: "warn", "fetching par2": "warn", extracting: "vio", finishing: "vio", moving: "acc", syncing: "acc", paused: ""};
 function renderActive() {
-  const jobs = S.jobs;
-  txt($("#actc"), S.q[1] + " active" + (S.q[1] > jobs.length ? " (showing " + jobs.length + ")" : "") + " · " + S.q[5].toLocaleString() + " articles queued");
+  // Jobs being moved to their final folder follow the downloading ones, same row shape.
+  // Once every byte is copied the mover is flushing to disk ("syncing").
+  const mv = (S.mvj || []).map(([id, name, cat, done, tot, rate, el2]) => done < tot ? [id, name, cat, "moving", tot, done, rate, 0, 0, el2] : [id, name, cat, "syncing", tot, done, 0, 0, 0, el2]);
+  const jobs = mv.length ? S.jobs.concat(mv) : S.jobs;
+  txt($("#actc"), S.q[1] + " active" + (S.q[1] > S.jobs.length ? " (showing " + S.jobs.length + ")" : "") + (mv.length ? " · " + mv.length + " moving" : "") + " · " + S.q[5].toLocaleString() + " articles queued");
   sync($("#act"), jobs, j => j[0], j => {
     const tr = row([["name", "name"], ["cat"], ["ph"], ["pr"], ["size", "n"], ["spd", "n"], ["miss", "n"], ["time", "n"], ["act", "act"]]);
     tr.ph = el("span", "pill"); tr.c.ph.appendChild(tr.ph);
@@ -536,6 +567,7 @@ function renderActive() {
     const f = tot ? done / tot : 0; scale(tr.pi, f); txt(tr.pt, (f * 100).toFixed(1) + "%");
     txt(tr.c.size, fbytes(done) + " / " + fbytes(tot)); txt(tr.c.spd, rate > 0 ? fbits(rate) : "–");
     txt(tr.c.miss, miss ? miss.toLocaleString() : "–"); txt(tr.c.time, fdur(el2));
+    tr.c.act.style.visibility = ph === "moving" || ph === "syncing" ? "hidden" : "";
     const paused = ph === "paused";
     txt(tr.pb, paused ? "▶" : "❚❚"); tr.pb.title = paused ? "Resume" : "Pause"; tr.pb.dataset.a = paused ? "resume" : "pause";
   }, "Nothing downloading", 9);
@@ -674,7 +706,10 @@ $("#loginf").onsubmit = async e => {
 
 // ---------- main loop ----------
 function frame(now) {
-  if (dirty) { dirty = false; render(); drawGraph(); }
+  // The graph scrolls continuously, so it redraws every frame while live.
+  const dt = tickClock(now);
+  if (dirty) { dirty = false; render(); drawGraph(dt); }
+  else if (lastK >= 0 && !document.hidden) drawGraph(dt);
   if (S) {
     if (S.qv !== qv) { qv = S.qv; qDirty = true; }
     if (S.hv !== hv) { hv = S.hv; hDirty = true; }

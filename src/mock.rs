@@ -60,12 +60,17 @@ struct Store {
     idx: HashMap<String, (usize, usize)>,
     /// Message-ids answered with an error (simulated missing articles) and the reply.
     drop: HashMap<String, String>,
+    /// Delay before each "not found" reply (some providers take ~1 s to say 430).
+    miss_ms: u64,
+    /// Per-connection bandwidth cap in bytes/s (0 = unlimited).
+    conn_rate: u64,
 }
 
 /// `drop`: list of `substring:every[:code]` rules; ids containing `substring` whose part
-/// number is divisible by `every` are reported missing (every=0 drops all matches),
+/// number is divisible by `every` are reported missing (every=0 drops all matches;
+/// `~every` drops all but those),
 /// with reply `code` (default 430).
-pub fn serve(dir: &Path, port: u16, tls: bool, drop_rules: &[String]) -> io::Result<()> {
+pub fn serve(dir: &Path, port: u16, tls: bool, drop_rules: &[String], miss_ms: u64, conn_mbs: u64) -> io::Result<()> {
     let data = fs::read(dir.join("articles.bin"))?;
     let mut idx = HashMap::new();
     for line in fs::read_to_string(dir.join("index.tsv"))?.lines() {
@@ -78,17 +83,21 @@ pub fn serve(dir: &Path, port: u16, tls: bool, drop_rules: &[String]) -> io::Res
         for r in drop_rules {
             let mut it = r.splitn(3, ':');
             let sub = it.next().unwrap_or("");
-            let every: usize = it.next().unwrap_or("0").parse().unwrap_or(0);
+            // A leading '~' inverts the rule: drop all matches except every `every`-th.
+            let (inv, every) = match it.next().unwrap_or("0") {
+                e if e.starts_with('~') => (true, e[1..].parse::<usize>().unwrap_or(0)),
+                e => (false, e.parse().unwrap_or(0)),
+            };
             let code = it.next().unwrap_or("430");
             let part: usize = id.rsplit('.').next().and_then(|t| t.split('@').next()).and_then(|n| n.parse().ok()).unwrap_or(1);
-            if id.contains(sub) && (every == 0 || part % every == every - 1) {
+            if id.contains(sub) && (every == 0 || (part % every == every - 1) != inv) {
                 drop.insert(id.clone(), code.to_string());
             }
         }
     }
     eprintln!("mock: dropping {} articles", drop.len());
     eprintln!("mock: {} articles, {:.1} GB in RAM, port {port}, tls={tls}", idx.len(), data.len() as f64 / 1e9);
-    let store = Arc::new(Store { data, idx, drop });
+    let store = Arc::new(Store { data, idx, drop, miss_ms, conn_rate: conn_mbs * 1_000_000 });
     let server_cfg = if tls {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert = ck.cert.der().clone();
@@ -117,11 +126,20 @@ pub fn serve(dir: &Path, port: u16, tls: bool, drop_rules: &[String]) -> io::Res
     Ok(())
 }
 
+fn miss<S: Write>(s: &mut S, st: &Store, reply: &str) -> io::Result<()> {
+    if st.miss_ms > 0 {
+        s.flush()?;
+        std::thread::sleep(std::time::Duration::from_millis(st.miss_ms));
+    }
+    s.write_all(reply.as_bytes())
+}
+
 fn handle<S: Read + Write>(mut s: S, st: &Store) -> io::Result<()> {
     s.write_all(b"200 mock ready\r\n")?;
     s.flush()?;
     let mut buf = vec![0u8; 65536];
     let mut have = 0;
+    let (t0, mut sent) = (std::time::Instant::now(), 0u64);
     loop {
         let n = s.read(&mut buf[have..])?;
         if n == 0 {
@@ -136,9 +154,25 @@ fn handle<S: Read + Write>(mut s: S, st: &Store) -> io::Result<()> {
             if up.starts_with("BODY ") {
                 let id = line[5..].trim();
                 match (st.drop.get(id), st.idx.get(id)) {
-                    (Some(code), _) => s.write_all(format!("{code} simulated failure\r\n").as_bytes())?,
-                    (None, Some(&(o, l))) => s.write_all(&st.data[o..o + l])?,
-                    (None, None) => s.write_all(b"430 no such article\r\n")?,
+                    (Some(code), _) => miss(&mut s, st, &format!("{code} simulated failure\r\n"))?,
+                    (None, Some(&(o, l))) => {
+                        if st.conn_rate > 0 {
+                            sent += l as u64;
+                            let due = std::time::Duration::from_secs_f64(sent as f64 / st.conn_rate as f64);
+                            if let Some(w) = due.checked_sub(t0.elapsed()) {
+                                std::thread::sleep(w);
+                            }
+                        }
+                        s.write_all(&st.data[o..o + l])?
+                    }
+                    (None, None) => miss(&mut s, st, "430 no such article\r\n")?,
+                }
+            } else if up.starts_with("STAT ") {
+                let id = line[5..].trim();
+                match (st.drop.get(id), st.idx.get(id)) {
+                    (Some(code), _) => miss(&mut s, st, &format!("{code} simulated failure\r\n"))?,
+                    (None, Some(_)) => s.write_all(format!("223 0 {id}\r\n").as_bytes())?,
+                    (None, None) => miss(&mut s, st, "430 no such article\r\n")?,
                 }
             } else if up.starts_with("AUTHINFO USER") {
                 s.write_all(b"381 more\r\n")?;

@@ -1,0 +1,49 @@
+__version__ = 19
+__encoding__ = utf-8
+[misc]
+host = 127.0.0.1
+port = 18080
+api_key = benchkey
+nzb_key = benchnzbkey
+download_dir = /dev/shm/b/sab/inc
+complete_dir = /dev/shm/b/sab/done
+admin_dir = /dev/shm/b/sab/admin
+log_dir = /dev/shm/b/sab/logs
+dirscan_dir = ""
+check_new_rel = 0
+auto_browser = 0
+enable_https = 0
+inet_exposure = 4
+host_whitelist = ""
+local_ranges = ""
+CACHE_LINE
+DIRECT_UNPACK_LINE
+[servers]
+[[mock]]
+name = mock
+displayname = mock
+host = 127.0.0.1
+port = 5563
+username = bench
+password = bench
+connections = 50
+ssl = 1
+ssl_verify = 0
+enable = 1
+optional = 0
+priority = 0
+[categories]
+[[*]]
+name = *
+order = 0
+pp = 3
+script = None
+dir = ""
+priority = 0
+[[bench]]
+name = bench
+order = 0
+pp = ""
+script = Default
+dir = bench
+priority = -100
