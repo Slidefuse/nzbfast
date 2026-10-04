@@ -21,11 +21,18 @@ pub const O_DIRECT: i32 = libc::O_DIRECT;
 #[cfg(not(target_os = "linux"))]
 pub const O_DIRECT: i32 = 0;
 
-/// Reserves the file's blocks up front (falls back to a sparse resize).
+/// Reserves the file's blocks up front (falls back to a sparse resize). Not on tmpfs:
+/// there fallocate zeroes every page at once (about 0.1 s of CPU per GB, on the thread
+/// that plans the job), and the download writes the same pages again anyway.
 fn preallocate(file: &File, size: u64) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
-    if unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, size as i64) } == 0 {
-        return Ok(());
+    {
+        const TMPFS_MAGIC: i64 = 0x0102_1994;
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        let tmpfs = unsafe { libc::fstatfs(file.as_raw_fd(), &mut st) } == 0 && st.f_type as i64 == TMPFS_MAGIC;
+        if !tmpfs && unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, size as i64) } == 0 {
+            return Ok(());
+        }
     }
     file.set_len(size)
 }

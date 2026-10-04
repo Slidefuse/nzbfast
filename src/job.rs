@@ -17,7 +17,7 @@
 use crate::gf16;
 use crate::nzb::{subject_filename, Nzb, NzbSeg};
 use crate::outfile::{IoOwner, OutFile};
-use crate::par2::{self, Par2Set};
+use crate::par2::{self, Par2Set, Par2Sets};
 use crate::queue::{JobRoute, Queues, Work};
 use crate::rar::{self, RarVol};
 use crate::yenc::YInfo;
@@ -157,6 +157,7 @@ pub struct Job {
     pub missing: AtomicUsize,
     pub phase: AtomicU8,
     cancelled: AtomicBool,
+    reported: AtomicBool,
     /// `Some` while paused: work items held back from the queue.
     parked: Mutex<Option<Vec<Work>>>,
     /// Which servers have this job's articles.
@@ -176,6 +177,12 @@ pub struct JobResult {
     pub ok: bool,
     pub summary: String,
     pub parts: Vec<String>,
+}
+
+enum SetRepair {
+    /// This many more recovery blocks are needed.
+    Short(usize),
+    Failed(String),
 }
 
 enum RepairOutcome {
@@ -489,6 +496,7 @@ impl Job {
             missing: AtomicUsize::new(0),
             phase: AtomicU8::new(PH_PROBE),
             cancelled: AtomicBool::new(false),
+            reported: AtomicBool::new(false),
             parked: Mutex::new(None),
             route: JobRoute::default(),
             grant: AtomicU64::new(u64::MAX),
@@ -565,11 +573,24 @@ impl Job {
             };
             let path = self.cur(orig);
             let want = sanitize(&set.files[&set.recovery_ids[k]].name);
-            if !path.starts_with(&aux) || path.file_name() == want.file_name() {
+            let wname = want.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            // An archive volume that could not be recognised from its data (its first
+            // segment was missing and its name obfuscated) joins the other volumes.
+            let dir = if path.starts_with(&aux) {
+                path.parent().map(Path::to_path_buf)
+            } else if looks_like_rar(&wname) {
+                Some(aux.join("rar"))
+            } else if looks_like_7z(&wname) {
+                Some(aux.join("7z"))
+            } else {
+                None
+            };
+            let Some(dir) = dir else { continue };
+            let dst = dir.join(&wname);
+            if dst == path {
                 continue;
             }
-            let Some(dir) = path.parent() else { continue };
-            let dst = dir.join(want.file_name().unwrap_or_default());
+            let _ = fs::create_dir_all(&dir);
             if !dst.exists() && fs::rename(&path, &dst).is_ok() {
                 self.renamed.lock().unwrap().insert(orig.clone(), dst);
                 n += 1;
@@ -584,11 +605,11 @@ impl Job {
         if plan.par2_outs.is_empty() {
             return 0;
         }
-        let set = self.load_par2(plan);
-        if set.files.is_empty() {
+        let sets = self.load_par2(plan);
+        let known: std::collections::HashSet<&str> = sets.files().map(|f| f.name.as_str()).collect();
+        if known.is_empty() {
             return 0;
         }
-        let known: std::collections::HashSet<&str> = set.files.values().map(|f| f.name.as_str()).collect();
         let mut n = 0;
         for t in &plan.targets {
             let Target::Plain { out } = *t else { continue };
@@ -609,7 +630,7 @@ impl Job {
             let mut head = vec![0u8; (meta.len() as usize).min(16384)];
             read_fill(&f, &mut head, 0);
             let id = par2::md5_16k(&head);
-            let mut hits = set.files.values().filter(|d| d.len == meta.len() && d.md5_16k == id);
+            let mut hits = sets.files().filter(|d| d.len == meta.len() && d.md5_16k == id);
             let (Some(d), None) = (hits.next(), hits.next()) else {
                 continue;
             };
@@ -625,16 +646,16 @@ impl Job {
         n
     }
 
-    /// The par2 set of this job (index plus any recovery volumes fetched so far).
-    fn load_par2(&self, plan: &Plan) -> Par2Set {
-        let mut set = Par2Set::default();
+    /// The par2 sets of this job (index files plus any recovery volumes fetched so far).
+    fn load_par2(&self, plan: &Plan) -> Par2Sets {
+        let mut sets = Par2Sets::default();
         for &o in &plan.par2_outs {
-            set.add_file(fs::read(self.cur(&plan.paths[o])).unwrap_or_default());
+            sets.add_file(fs::read(self.cur(&plan.paths[o])).unwrap_or_default());
         }
         for p in self.repair.lock().unwrap().paths.clone() {
-            set.add_file(fs::read(p).unwrap_or_default());
+            sets.add_file(fs::read(p).unwrap_or_default());
         }
-        set
+        sets
     }
 
     pub fn seg_bytes(&self, file: u32, seg: u32) -> u64 {
@@ -815,7 +836,14 @@ impl Job {
     fn segment_done(self: &Arc<Self>) {
         if self.remaining.fetch_sub(1, Relaxed) == 1 {
             let job = self.clone();
-            std::thread::spawn(move || job.finalize());
+            std::thread::spawn(move || {
+                // A bug in post-processing must fail the job, not leave it unfinished forever.
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.clone().finalize())).is_err() {
+                    if let Some(plan) = job.plan.get() {
+                        job.report(plan, false, vec!["internal error during post-processing (see the log)".into()]);
+                    }
+                }
+            });
         }
     }
 
@@ -2047,9 +2075,7 @@ impl Job {
         let ainv: Vec<gf16::MulTable> = ainv.iter().map(|&c| gf16::MulTable::new(c)).collect();
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
         let stripe = (s.div_ceil(threads) + 1) & !1;
-        // Each pass over the intact slices updates all k accumulators; keep them within L2
-        // (k * tile <= ~512 KiB) instead of streaming k full stripes through memory.
-        let tile = ((512 << 10) / k.max(1)).clamp(8 << 10, stripe.max(2)) & !63;
+        let tile = tile_size(k, stripe);
         let err = Mutex::new(None);
         std::thread::scope(|sc| {
             for t in 0..threads {
@@ -2098,19 +2124,54 @@ impl Job {
         Ok(())
     }
 
+    /// Verifies the job against every par2 set it has and repairs what is damaged;
+    /// fetches (more) recovery volumes when a set lacks the blocks for it.
     fn try_repair(self: &Arc<Self>, plan: &Plan, allow_fetch: bool) -> RepairOutcome {
         let mut files: Vec<Option<File>> = plan.paths.iter().map(|p| open_rw(&self.cur(p)).ok()).collect();
-        let set = self.load_par2(plan);
-        if !set.ready() {
-            let already: Vec<u32> = self.repair.lock().unwrap().outs.keys().copied().collect();
-            let smallest =
-                self.files.iter().enumerate().filter(|(i, f)| f.skip && !already.contains(&(*i as u32))).min_by_key(|(_, f)| f.segs.len()).map(|(i, _)| i);
-            match smallest {
-                Some(i) if allow_fetch => return self.fetch_recovery(&[i]),
-                _ => return RepairOutcome::Failed("par2: no usable index (cannot verify or repair)".into()),
+        let sets = self.load_par2(plan).ready();
+        let already: Vec<u32> = self.repair.lock().unwrap().outs.keys().copied().collect();
+        let unfetched = || self.files.iter().enumerate().filter(|(i, f)| f.skip && !already.contains(&(*i as u32)));
+        if sets.is_empty() {
+            return match unfetched().min_by_key(|(_, f)| f.segs.len()).map(|(i, _)| i) {
+                Some(i) if allow_fetch => self.fetch_recovery(&[i]),
+                _ => RepairOutcome::Failed("par2: no usable index (cannot verify or repair)".into()),
+            };
+        }
+        let (mut msgs, mut need) = (vec![], 0);
+        for (n, set) in sets.iter().enumerate() {
+            let label = if n == 0 { "par2".to_string() } else { format!("par2 set {}", n + 1) };
+            match self.repair_set(plan, set, &mut files) {
+                Ok(m) => msgs.push(format!("{label}: {m}")),
+                Err(SetRepair::Short(n)) => need += n,
+                Err(SetRepair::Failed(e)) => return RepairOutcome::Failed(format!("{label}: {e}")),
             }
         }
-        let mut map = self.par2_map(plan, &set);
+        if need == 0 {
+            return RepairOutcome::Repaired(msgs.join("; "));
+        }
+        if !allow_fetch {
+            return RepairOutcome::Failed(format!("par2: {need} more recovery blocks needed than downloaded"));
+        }
+        let mut cands: Vec<(u32, usize)> = unfetched().map(|(i, f)| (f.par2_blocks.unwrap_or(1), i)).collect();
+        cands.sort();
+        let mut chosen = vec![];
+        let mut have = 0;
+        for (b, i) in cands {
+            if have >= need {
+                break;
+            }
+            chosen.push(i);
+            have += b as usize;
+        }
+        if have < need {
+            return RepairOutcome::Failed(format!("par2: need {need} more recovery blocks, only {have} available"));
+        }
+        self.fetch_recovery(&chosen)
+    }
+
+    /// Verifies and repairs the files of one par2 set.
+    fn repair_set(&self, plan: &Plan, set: &Par2Set, files: &mut Vec<Option<File>>) -> Result<String, SetRepair> {
+        let mut map = self.par2_map(plan, set);
         // Files the NZB does not have at all are rebuilt from scratch into new files.
         let aux = self.work.join(".aux");
         for (k, m) in map.iter_mut().enumerate() {
@@ -2136,52 +2197,25 @@ impl Job {
             }
         }
         let t0 = Instant::now();
-        let (damaged, total) = Self::find_damaged(plan, &files, &set, &map);
+        let (damaged, total) = Self::find_damaged(plan, files, set, &map);
         if damaged.is_empty() {
-            self.rename_by_par2(plan, &set, &map);
-            return RepairOutcome::Repaired(format!("par2: all {total} slices verified"));
+            self.rename_by_par2(plan, set, &map);
+            return Ok(format!("all {total} slices verified"));
         }
-        if set.recv.len() >= damaged.len() {
-            self.phase.store(PH_REPAIR, Relaxed);
-            let t1 = Instant::now();
-            if let Err(e) = Self::solve(plan, &files, &set, &map, &damaged, total) {
-                return RepairOutcome::Failed(e);
-            }
-            let (still, _) = Self::find_damaged(plan, &files, &set, &map);
-            if !still.is_empty() {
-                return RepairOutcome::Failed(format!("par2: {} slices still damaged after repair", still.len()));
-            }
-            // Leftover archive volumes take the names par2 knows them by, so a set is
-            // never split between two naming schemes when it is unpacked.
-            self.rename_by_par2(plan, &set, &map);
-            return RepairOutcome::Repaired(format!(
-                "par2: repaired {}/{total} slices (verify {:.2}s, solve {:.2}s)",
-                damaged.len(),
-                (t1 - t0).as_secs_f64(),
-                t1.elapsed().as_secs_f64()
-            ));
+        if set.recv.len() < damaged.len() {
+            return Err(SetRepair::Short(damaged.len() - set.recv.len()));
         }
-        let need = damaged.len() - set.recv.len();
-        if !allow_fetch {
-            return RepairOutcome::Failed(format!("par2: {} slices damaged, only {} recovery blocks", damaged.len(), set.recv.len()));
+        self.phase.store(PH_REPAIR, Relaxed);
+        let t1 = Instant::now();
+        Self::solve(plan, files, set, &map, &damaged, total).map_err(SetRepair::Failed)?;
+        let (still, _) = Self::find_damaged(plan, files, set, &map);
+        if !still.is_empty() {
+            return Err(SetRepair::Failed(format!("{} slices still damaged after repair", still.len())));
         }
-        let already: Vec<u32> = self.repair.lock().unwrap().outs.keys().copied().collect();
-        let mut cands: Vec<(u32, usize)> =
-            self.files.iter().enumerate().filter(|(i, f)| f.skip && !already.contains(&(*i as u32))).map(|(i, f)| (f.par2_blocks.unwrap_or(1), i)).collect();
-        cands.sort();
-        let mut chosen = vec![];
-        let mut have = 0;
-        for (b, i) in cands {
-            if have >= need {
-                break;
-            }
-            chosen.push(i);
-            have += b as usize;
-        }
-        if have < need {
-            return RepairOutcome::Failed(format!("par2: need {need} more recovery blocks, only {have} available"));
-        }
-        self.fetch_recovery(&chosen)
+        // Leftover archive volumes take the names par2 knows them by, so a set is
+        // never split between two naming schemes when it is unpacked.
+        self.rename_by_par2(plan, set, &map);
+        Ok(format!("repaired {}/{total} slices (verify {:.2}s, solve {:.2}s)", damaged.len(), (t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64()))
     }
 
     /// Downloads the given recovery files, then re-enters finalize (stage 1).
@@ -2292,13 +2326,13 @@ impl Job {
                 rar::base_name(&n).is_empty() && !looks_like_7z(&n)
             });
             if unordered {
-                let set = self.load_par2(plan);
-                if set.ready() {
+                let mut n = 0;
+                for set in self.load_par2(plan).ready() {
                     let map = self.par2_map(plan, &set);
-                    let n = self.rename_by_par2(plan, &set, &map);
-                    if n > 0 {
-                        notes.push(format!("{n} volumes renamed from par2"));
-                    }
+                    n += self.rename_by_par2(plan, &set, &map);
+                }
+                if n > 0 {
+                    notes.push(format!("{n} volumes renamed from par2"));
                 }
             }
         }
@@ -2352,6 +2386,9 @@ impl Job {
     }
 
     fn report(&self, plan: &Plan, ok: bool, mut parts: Vec<String>) {
+        if self.reported.swap(true, Relaxed) {
+            return;
+        }
         parts.extend(plan.notes.iter().take(3).cloned());
         if plan.notes.len() > 3 {
             parts.push(format!("(+{} more notes)", plan.notes.len() - 3));
@@ -2361,12 +2398,30 @@ impl Job {
     }
 }
 
+/// Bytes of each repair stripe processed per pass. Each pass over the intact slices
+/// updates all k accumulators, so they are kept within L2 (k * tile <= ~512 KiB, at least
+/// 8 KiB) instead of streaming k full stripes through memory; never more than the stripe
+/// (small par2 slices make stripes of a few KiB), and even (16-bit words; stripes are even).
+fn tile_size(k: usize, stripe: usize) -> usize {
+    (((512 << 10) / k.max(1)).max(8 << 10) & !63).min(stripe).max(2) & !1
+}
+
 /// The global work queue, needed to schedule repair downloads from finalize threads.
 pub static QUEUE: OnceLock<Arc<Queues>> = OnceLock::new();
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repair_tiles() {
+        for k in [1, 3, 64, 1000, 40000] {
+            for stripe in [2, 4, 62, 64, 66, 2048, 5042, 7980, 8192, 65536, 1 << 20] {
+                let t = tile_size(k, stripe);
+                assert!(t >= 2 && t.is_multiple_of(2) && t <= stripe.max(2), "k {k} stripe {stripe}: tile {t}");
+            }
+        }
+    }
 
     #[test]
     fn mkv_titles() {
