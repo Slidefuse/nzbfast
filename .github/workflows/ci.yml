@@ -2,7 +2,12 @@ name: ci
 
 on:
   push:
+    branches: ["**"]
+    tags: ["v*"]
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   check:
@@ -12,6 +17,54 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the tag matches Cargo.toml
+        if: github.ref_type == 'tag'
+        run: |
+          v=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "nzbfast") | .version')
+          [ "$GITHUB_REF_NAME" = "v$v" ] || { echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $v"; exit 1; }
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace --release
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-22.04 }
+          - { arch: aarch64, runner: ubuntu-22.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --release --locked
+      - run: cargo build --release --locked
+      - name: Package
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then ver=$GITHUB_REF_NAME; else ver=${GITHUB_SHA::7}; fi
+          name=nzbfast-$ver-${{ matrix.arch }}-linux
+          mkdir -p $name/deploy
+          cp target/release/nzbfast README.md $name/
+          cp deploy/nzbfast.example.toml deploy/nzbfast.service $name/deploy/
+          tar czf $name.tar.gz $name
+          sha256sum $name.tar.gz > $name.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.arch }}
+          path: nzbfast-*.tar.gz*
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes nzbfast-*
