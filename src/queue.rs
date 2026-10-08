@@ -88,6 +88,7 @@ impl JobRoute {
             self.answers[server].store(0, Relaxed);
             self.passed[server].store(0, Relaxed);
         }
+        #[allow(deprecated)]
         let _ = self.recent[server].fetch_update(Relaxed, Relaxed, |r| Some(r << 1 | !hit as u64));
         let a = &self.answers[server];
         if a.load(Relaxed) < 64 {
@@ -437,6 +438,7 @@ impl Queues {
         for w in back.into_iter().rev() {
             if w.tried == 0 {
                 let b = w.job.seg_bytes(w.file, w.seg);
+                #[allow(deprecated)]
                 let _ = w.job.taken.fetch_update(Relaxed, Relaxed, |t| Some(t.saturating_sub(b)));
                 q.main.push_front(w);
             } else {
