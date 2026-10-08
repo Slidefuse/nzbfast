@@ -40,19 +40,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --release --locked
       - run: cargo build --release --locked
-      - name: Package
-        run: |
-          if [ "$GITHUB_REF_TYPE" = tag ]; then ver=$GITHUB_REF_NAME; else ver=${GITHUB_SHA::7}; fi
-          name=nzbfast-$ver-${{ matrix.arch }}-linux
-          mkdir -p $name/deploy
-          cp target/release/nzbfast README.md $name/
-          cp deploy/nzbfast.example.toml deploy/nzbfast.service $name/deploy/
-          tar czf $name.tar.gz $name
-          sha256sum $name.tar.gz > $name.tar.gz.sha256
-      - uses: actions/upload-artifact@v4
+      - run: cp target/release/nzbfast nzbfast-linux-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.arch }}
-          path: nzbfast-*.tar.gz*
+          path: nzbfast-linux-${{ matrix.arch }}
+          archive: false
 
   release:
     if: github.ref_type == 'tag'
@@ -61,10 +53,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
+          path: dist
           merge-multiple: true
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes nzbfast-*
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes $(find dist -type f)
