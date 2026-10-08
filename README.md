@@ -60,7 +60,7 @@ Full results, more graphs and the methodology: [docs/BENCHMARKS.md](docs/BENCHMA
 ## Requirements
 
 - Linux. On x86-64 the SIMD paths are picked at run time; other CPUs use portable code.
-- To build: Rust 1.89 or newer and a C++ compiler (for the bundled UnRAR library).
+- To build: Rust 1.99 or newer and a C++ compiler (for the bundled UnRAR library).
 - RAM for staging if you stage in `/dev/shm`; or a fast SSD.
 
 ## Install

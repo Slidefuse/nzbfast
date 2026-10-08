@@ -2,7 +2,7 @@
 name = "nzbfast"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.89"
+rust-version = "1.99"
 description = "A Usenet (NZB) downloader built for multi-gigabit links, with a SABnzbd-compatible API"
 readme = "README.md"
 keywords = ["usenet", "nzb", "nntp", "downloader", "sabnzbd"]
